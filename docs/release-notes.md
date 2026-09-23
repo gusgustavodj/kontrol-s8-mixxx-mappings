@@ -29,6 +29,14 @@ The integration allows users to control all four Mixxx decks using the two physi
 - Loading tracks into the corresponding deck.
 - Four-deck visualization on the displays.
 
+![Two-deck layout displayed on the Kontrol S8](images/release-notes/two-deck-view.jpeg)
+
+*Two-deck display layout.*
+
+![Four-deck layout displayed on the Kontrol S8](images/release-notes/four-deck-view.jpeg)
+
+*Four-deck display layout.*
+
 FLUX/Slip Mode is also implemented, but its behavior has not yet been tested by the developer.
 
 ## 🎚️ Mixer and Audio Control
@@ -133,6 +141,10 @@ Both Kontrol S8 displays are part of the implementation, presenting information 
 - Track-loading pop-ups.
 - Event pop-ups.
 
+![Track deck view with waveform and playback information on the Kontrol S8](images/release-notes/deck-view.jpeg)
+
+*Track deck view: waveform, position, and playback information.*
+
 Communication relies on a dedicated integration between Mixxx's internal state and the physical displays.
 
 ## Four Waveform Styles
@@ -149,6 +161,10 @@ When certain information is unavailable, the system can display contextual notif
 
 Pop-ups have also been implemented to report events and operation results, including track loading.
 
+![Event pop-up displayed on the Kontrol S8](images/release-notes/popups.jpeg)
+
+*Example of an event pop-up displayed on the controller.*
+
 Dedicated STEMS, Phrasing, and certain advanced Settings screens are planned for future implementation.
 
 ---
@@ -158,6 +174,10 @@ Dedicated STEMS, Phrasing, and certain advanced Settings screens are planned for
 Library navigation and track loading have been confirmed.
 
 Users can browse their music library and select tracks for loading into the decks using the physical controls.
+
+![Music library Browser displayed on the Kontrol S8](images/release-notes/browser.jpeg)
+
+*Music library Browser on the physical display. Browser Preview and Track Sorting still require adjustments, as noted above.*
 
 Two features are partially implemented and will receive further improvements:
 

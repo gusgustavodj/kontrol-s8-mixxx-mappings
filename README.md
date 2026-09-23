@@ -28,6 +28,14 @@ The Windows implementation includes the main mixing and performance controls dir
 - SYNC and MASTER controls and track loading into the corresponding deck.
 - Four-deck visualization on the integrated displays.
 
+![Two-deck layout displayed on the Kontrol S8](docs/images/release-notes/two-deck-view.jpeg)
+
+*Two-deck display layout.*
+
+![Four-deck layout displayed on the Kontrol S8](docs/images/release-notes/four-deck-view.jpeg)
+
+*Four-deck display layout.*
+
 FLUX/Slip Mode is implemented but has not yet been tested.
 
 ### Mixer and Audio
@@ -59,7 +67,19 @@ Both Kontrol S8 displays present Mixxx information, including:
 - Four-deck visualization, track-loading pop-ups, and event pop-ups.
 - **Four customizable waveform styles**, an addition introduced by this implementation.
 
+![Track deck view with waveform and playback information on the Kontrol S8](docs/images/release-notes/deck-view.jpeg)
+
+*Track deck view: waveform, position, and playback information.*
+
+![Music library Browser displayed on the Kontrol S8](docs/images/release-notes/browser.jpeg)
+
+*Music library Browser on the physical display. Browser Preview and Track Sorting still require adjustments.*
+
 The display bridge uses real Mixxx data. When information is unavailable, it can show contextual notices rather than simulate unavailable musical data.
+
+![Event pop-up displayed on the Kontrol S8](docs/images/release-notes/popups.jpeg)
+
+*Example of an event pop-up displayed on the controller.*
 
 ---
 
