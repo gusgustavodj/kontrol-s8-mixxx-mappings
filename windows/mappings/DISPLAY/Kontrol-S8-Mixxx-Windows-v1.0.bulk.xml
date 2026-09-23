@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MixxxControllerPreset schemaVersion="1" mixxxVersion="2.5.6">
+  <info>
+    <name>Kontrol S8 Mixxx Windows v1.0 Display</name>
+    <author>Kontrol S8 mapping contributors</author>
+    <description>Kontrol S8 Windows outgoing display mapping with 7000 ms splash.</description>
+    <devices>
+      <product protocol="bulk" vendor_id="0x17cc" product_id="0x1370" out_epaddr="0x04" interface_number="0x06" />
+    </devices>
+  </info>
+  <controller id="Kontrol S8 Mixxx Windows v1.0 Display" direction="out">
+    <scriptfiles>
+      <file filename="Kontrol-S8-Mixxx-Windows-v1.0-display.js" functionprefix="S8DisplayWindowsV1" /></scriptfiles>
+  </controller>
+</MixxxControllerPreset>

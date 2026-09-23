@@ -1,0 +1,50 @@
+name: Platform mapping request
+description: Request or propose a Kontrol S8 mapping for another platform
+title: "[Platform] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: "Describe technical requirements and share only material you have rights to publish. Do not upload private captures without authorization."
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+    validations:
+      required: true
+  - type: input
+    id: mixxx
+    attributes:
+      label: Mixxx version or revision
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Kontrol S8 model or hardware revision, if known
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal of the request
+    validations:
+      required: true
+  - type: textarea
+    id: interfaces
+    attributes:
+      label: Required HID, audio and display interfaces
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Known dependencies and limitations
+  - type: textarea
+    id: tests
+    attributes:
+      label: Available tests and results
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Can you contribute technical work?
+      options:
+        - 'Yes'
+        - 'Possibly'
+        - 'No'

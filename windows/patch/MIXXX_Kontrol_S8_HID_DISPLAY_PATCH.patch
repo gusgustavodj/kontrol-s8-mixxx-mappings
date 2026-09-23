@@ -1,0 +1,3168 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 95eb1c8..b10540b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3901,7 +3901,13 @@ if(BULK)
+   target_sources(mixxx-lib PRIVATE
+     src/controllers/bulk/bulkcontroller.cpp
+     src/controllers/bulk/bulkenumerator.cpp
++    src/controllers/bulk/nativenis8displaytransport.cpp
+   )
++  if(WIN32)
++    # The S8 display transport calls SetupDi* directly.
++    find_library(Setupapi_LIBRARY Setupapi REQUIRED)
++    target_link_libraries(mixxx-lib PRIVATE ${Setupapi_LIBRARY})
++  endif()
+   if(NOT HID)
+     target_sources(mixxx-lib PRIVATE
+       src/controllers/hid/legacyhidcontrollermapping.cpp
+diff --git a/res/controllers/engine-api.d.ts b/res/controllers/engine-api.d.ts
+index 22a8101..df76014 100644
+--- a/res/controllers/engine-api.d.ts
++++ b/res/controllers/engine-api.d.ts
+@@ -36,6 +36,35 @@ declare interface ScriptConnection {
+ 
+ declare namespace engine {
+     type SettingValue = string | number | boolean;
++    interface TrackMetadataSnapshot {
++        loaded: boolean;
++        title: string;
++        artist: string;
++        album: string;
++        key: string;
++        duration: number;
++    }
++    interface S8WaveformBin {
++        low: number;
++        mid: number;
++        high: number;
++        peak: number;
++    }
++    interface S8HotcueSnapshot {
++        slot: number;
++        position: number;
++        label: string;
++        color: string;
++    }
++    interface S8DisplayStateSnapshot {
++        available: boolean;
++        waveformComplete: boolean;
++        waveform: S8WaveformBin[];
++        overview: S8WaveformBin[];
++        hotcues: S8HotcueSnapshot[];
++        beatgridAvailable: boolean;
++        artworkAvailable: boolean;
++    }
+     /**
+      * Gets the value of a controller setting
+      * The value is either set in the preferences dialog,
+@@ -45,6 +74,16 @@ declare namespace engine {
+      */
+     function getSetting(name: string): SettingValue | undefined;
+ 
++    /**
++     * Returns a bounded, read-only metadata snapshot for the track loaded in a player group.
++     *
++     * @param group Player group, for example "[Channel1]"
++     */
++    function getTrackMetadata(group: string): TrackMetadataSnapshot;
++
++    /** Returns bounded, downsampled display-only state for an S8 deck screen. */
++    function getS8DisplayState(group: string): S8DisplayStateSnapshot;
++
+     /**
+      * Gets the control value
+      *
+diff --git a/src/controllers/bulk/bulkcontroller.cpp b/src/controllers/bulk/bulkcontroller.cpp
+index 97ec702..4223094 100644
+--- a/src/controllers/bulk/bulkcontroller.cpp
++++ b/src/controllers/bulk/bulkcontroller.cpp
+@@ -3,8 +3,11 @@
+ #include <libusb.h>
+ 
+ #include "controllers/bulk/bulksupported.h"
++#if defined(__WINDOWS__)
++#include "controllers/bulk/nativenis8displaytransport.h"
++#endif
++
+ #include "controllers/defs_controllers.h"
+-#include "moc_bulkcontroller.cpp"
+ #include "util/time.h"
+ #include "util/trace.h"
+ 
+@@ -55,19 +58,36 @@ void BulkReader::run() {
+ static QString get_string(libusb_device_handle* handle, uint8_t id) {
+     unsigned char buf[128] = { 0 };
+ 
+-    if (id) {
++    if (handle != nullptr && id) {
+         libusb_get_string_descriptor_ascii(handle, id, buf, sizeof(buf));
+     }
+ 
+     return QString::fromLatin1((char*)buf);
+ }
+ 
++static QString controllerName(
++        libusb_device_handle* handle,
++        const struct libusb_device_descriptor* desc) {
++    const QString product = get_string(handle, desc->iProduct);
++    if (!product.isEmpty()) {
++        return QString("%1 %2").arg(product, get_string(handle, desc->iSerialNumber));
++    }
++
++#if defined(__WINDOWS__)
++    if (NativeNiS8DisplayTransport::isTargetDevice(desc->idVendor, desc->idProduct)) {
++        return QStringLiteral("Native Instruments Traktor Kontrol S8");
++    }
++#endif
++
++    return QStringLiteral("USB Bulk %1:%2")
++            .arg(desc->idVendor, 4, 16, QLatin1Char('0'))
++            .arg(desc->idProduct, 4, 16, QLatin1Char('0'));
++}
++
+ BulkController::BulkController(libusb_context* context,
+         libusb_device_handle* handle,
+         struct libusb_device_descriptor* desc)
+-        : Controller(QString("%1 %2").arg(
+-                  get_string(handle, desc->iProduct),
+-                  get_string(handle, desc->iSerialNumber))),
++        : Controller(controllerName(handle, desc)),
+           m_context(context),
+           m_phandle(handle),
+           m_inEndpointAddr(0),
+@@ -75,6 +95,19 @@ BulkController::BulkController(libusb_context* context,
+     m_vendorId = desc->idVendor;
+     m_productId = desc->idProduct;
+ 
++#if defined(__WINDOWS__) || defined(__APPLE__)
++    // Mapping matching happens before open(). Populate the interface number
++    // from the same supported-device table used by open(), otherwise a
++    // composite output-only device cannot match interface_number on Windows.
++    for (int i = 0; bulk_supported[i].vendor_id; ++i) {
++        if (bulk_supported[i].vendor_id == m_vendorId &&
++                bulk_supported[i].product_id == m_productId) {
++            m_interfaceNumber = bulk_supported[i].interface_number;
++            break;
++        }
++    }
++#endif
++
+     m_manufacturer = get_string(handle, desc->iManufacturer);
+     m_product = get_string(handle, desc->iProduct);
+     m_sUID = get_string(handle, desc->iSerialNumber);
+@@ -91,6 +124,7 @@ BulkController::~BulkController() {
+         close();
+     }
+ }
++#include "moc_bulkcontroller.cpp"
+ 
+ QString BulkController::mappingExtension() {
+     return BULK_MAPPING_EXTENSION;
+@@ -149,6 +183,12 @@ bool BulkController::matchProductInfo(const ProductInfo& product) {
+     return true;
+ }
+ 
++#if defined(__WINDOWS__)
++bool BulkController::usesNativeNiS8DisplayTransport() const {
++    return NativeNiS8DisplayTransport::isTargetDevice(m_vendorId, m_productId);
++}
++#endif
++
+ int BulkController::open() {
+     if (isOpen()) {
+         qCWarning(m_logBase) << "USB Bulk device" << getName() << "already open";
+@@ -174,6 +214,33 @@ int BulkController::open() {
+         return -1;
+     }
+ 
++#if defined(__WINDOWS__)
++    if (usesNativeNiS8DisplayTransport()) {
++        // The S8 display path belongs to the Native Instruments MI_06 driver.
++        // It must not detach, claim, or transfer through libusb on IF6.
++        m_pNativeNiS8DisplayTransport = std::make_unique<NativeNiS8DisplayTransport>();
++        QString failure;
++        if (!m_pNativeNiS8DisplayTransport->open(&failure)) {
++            qCWarning(m_logBase) << "Unable to open native NI S8 display transport for"
++                                 << getName() << ":" << failure;
++            m_pNativeNiS8DisplayTransport.reset();
++            return -1;
++        }
++
++        m_nativeNiS8TransportFailureLogged = false;
++        startEngine();
++        if (m_pMapping &&
++                m_pMapping->getDeviceDirection() &
++                        LegacyControllerMapping::DeviceDirection::Incoming) {
++            qCWarning(m_logBase) << "Native NI S8 display transport is output-only for"
++                                 << getName();
++        }
++        applyMapping();
++        setOpen(true);
++        return 0;
++    }
++#endif
++
+     // XXX: we should enumerate devices and match vendor, product, and serial
+     if (m_phandle == nullptr) {
+         m_phandle = libusb_open_device_with_vid_pid(
+@@ -188,7 +255,7 @@ int BulkController::open() {
+ #if defined(__WINDOWS__) || defined(__APPLE__)
+     if (m_interfaceNumber && libusb_kernel_driver_active(m_phandle, m_interfaceNumber) == 1) {
+         qCDebug(m_logBase) << "Found a driver active for" << getName();
+-        if (libusb_detach_kernel_driver(m_phandle, 0) == 0)
++        if (libusb_detach_kernel_driver(m_phandle, m_interfaceNumber) == 0)
+             qCDebug(m_logBase) << "Kernel driver detached for" << getName();
+         else {
+             qCWarning(m_logBase) << "Couldn't detach kernel driver for" << getName();
+@@ -243,6 +310,22 @@ int BulkController::close() {
+ 
+     qCInfo(m_logBase) << "Shutting down USB Bulk device" << getName();
+ 
++#if defined(__WINDOWS__)
++    if (usesNativeNiS8DisplayTransport()) {
++        // Stop the script before discarding pending display frames. The native
++        // writer then waits for any active OVERLAPPED request before closing
++        // its MI_06 handle.
++        stopEngine();
++        m_pNativeNiS8DisplayTransport.reset();
++        if (m_phandle != nullptr) {
++            libusb_close(m_phandle);
++            m_phandle = nullptr;
++        }
++        setOpen(false);
++        return 0;
++    }
++#endif
++
+     // Stop the reading thread
+     if (m_pReader == nullptr &&
+             m_pMapping->getDeviceDirection() &
+@@ -298,16 +381,44 @@ void BulkController::sendBytes(const QByteArray& data) {
+         return;
+     }
+ 
++#if defined(__WINDOWS__)
++    if (usesNativeNiS8DisplayTransport()) {
++        QString failure;
++        if (m_pNativeNiS8DisplayTransport == nullptr ||
++                !m_pNativeNiS8DisplayTransport->enqueueFrame(data, &failure)) {
++            // The native writer makes a timeout or rejected request terminal for
++            // its open handle. Do not turn a fast display renderer into an
++            // unbounded warning stream while waiting for an explicit reopen.
++            if (!m_nativeNiS8TransportFailureLogged) {
++                qCWarning(m_logOutput) << "Unable to enqueue S8 display frame for" << getName()
++                                       << "serial #" << m_sUID << "-" << failure;
++                m_nativeNiS8TransportFailureLogged = true;
++            }
++        }
++        return;
++    }
++#endif
++
+     int ret;
+     int transferred;
+ 
++#if defined(__WINDOWS__)
++    // The native S8 branch above returns before this legacy fallback. Keep the
++    // historical Windows fallback bound without changing the non-Windows S8
++    // libusb behavior.
++    const unsigned int timeoutMs =
++            (m_vendorId == 0x17cc && m_productId == 0x1370) ? 250 : 0;
++#else
++    const unsigned int timeoutMs = 0;
++#endif
++
+     // XXX: don't get drunk again.
+     ret = libusb_bulk_transfer(m_phandle,
+             m_outEndpointAddr,
+             (unsigned char*)data.constData(),
+             data.size(),
+             &transferred,
+-            0);
++            timeoutMs);
+     if (ret < 0) {
+         qCWarning(m_logOutput) << "Unable to send data to" << getName()
+                                << "serial #" << m_sUID << "-" << libusb_error_name(ret);
+diff --git a/src/controllers/bulk/bulkcontroller.h b/src/controllers/bulk/bulkcontroller.h
+index 019fc27..ad2c1ae 100644
+--- a/src/controllers/bulk/bulkcontroller.h
++++ b/src/controllers/bulk/bulkcontroller.h
+@@ -9,6 +9,10 @@
+ struct libusb_device_handle;
+ struct libusb_context;
+ 
++#if defined(__WINDOWS__)
++class NativeNiS8DisplayTransport;
++#endif
++
+ /// USB Bulk controller backend
+ class BulkReader : public QThread {
+     Q_OBJECT
+@@ -68,6 +72,10 @@ class BulkController : public Controller {
+ 
+     bool matchProductInfo(const ProductInfo& product);
+ 
++#if defined(__WINDOWS__)
++    bool usesNativeNiS8DisplayTransport() const;
++#endif
++
+     libusb_context* m_context;
+     libusb_device_handle *m_phandle;
+ 
+@@ -78,7 +86,7 @@ class BulkController : public Controller {
+     unsigned char m_inEndpointAddr;
+     unsigned char m_outEndpointAddr;
+ #if defined(__WINDOWS__) || defined(__APPLE__)
+-    unsigned int m_interfaceNumber;
++    unsigned int m_interfaceNumber = 0;
+ #endif
+     QString m_manufacturer;
+     QString m_product;
+@@ -86,4 +94,8 @@ class BulkController : public Controller {
+     QString m_sUID;
+     BulkReader* m_pReader;
+     std::unique_ptr<LegacyHidControllerMapping> m_pMapping;
++#if defined(__WINDOWS__)
++    std::unique_ptr<NativeNiS8DisplayTransport> m_pNativeNiS8DisplayTransport;
++    bool m_nativeNiS8TransportFailureLogged{false};
++#endif
+ };
+diff --git a/src/controllers/bulk/bulkenumerator.cpp b/src/controllers/bulk/bulkenumerator.cpp
+index 917e60b..a7cb3d0 100644
+--- a/src/controllers/bulk/bulkenumerator.cpp
++++ b/src/controllers/bulk/bulkenumerator.cpp
+@@ -4,7 +4,9 @@
+ 
+ #include "controllers/bulk/bulkcontroller.h"
+ #include "controllers/bulk/bulksupported.h"
+-#include "moc_bulkenumerator.cpp"
++#if defined(__WINDOWS__)
++#include "controllers/bulk/nativenis8displaytransport.h"
++#endif
+ 
+ BulkEnumerator::BulkEnumerator(UserSettingsPointer pConfig)
+         : ControllerEnumerator(),
+@@ -31,8 +33,31 @@ static bool is_interesting(struct libusb_device_descriptor *desc) {
+     return false;
+ }
+ 
++#if defined(__WINDOWS__)
++static void appendNativeNiS8DisplayController(
++        QList<Controller*>* devices,
++        libusb_context* context) {
++    QString failure;
++    if (!NativeNiS8DisplayTransport::hasUniqueTarget(&failure)) {
++        qDebug() << "Native NI S8 MI_06 display interface is unavailable:" << failure;
++        return;
++    }
++
++    // The controller is intentionally synthetic: discovery and opening of
++    // MI_06 happen through SetupDi/CreateFileW in the native transport, so it
++    // does not depend on a libusb handle or a WinUSB binding for IF6.
++    libusb_device_descriptor descriptor{};
++    descriptor.idVendor = 0x17cc;
++    descriptor.idProduct = 0x1370;
++    devices->push_back(new BulkController(context, nullptr, &descriptor));
++}
++#endif
++
+ QList<Controller*> BulkEnumerator::queryDevices() {
+     qDebug() << "Scanning USB Bulk devices:";
++#if defined(__WINDOWS__)
++    appendNativeNiS8DisplayController(&m_devices, m_context);
++#endif
+     libusb_device **list;
+     ssize_t cnt = libusb_get_device_list(m_context, &list);
+     ssize_t i = 0;
+@@ -44,6 +69,13 @@ QList<Controller*> BulkEnumerator::queryDevices() {
+ 
+         libusb_get_device_descriptor(device, &desc);
+         if (is_interesting(&desc)) {
++#if defined(__WINDOWS__)
++            if (NativeNiS8DisplayTransport::isTargetDevice(desc.idVendor, desc.idProduct)) {
++                // S8 IF6 is represented above through its MI_06 interface.
++                // Never fall through to libusb open/claim for this target.
++                continue;
++            }
++#endif
+             struct libusb_device_handle* handle = nullptr;
+             err = libusb_open(device, &handle);
+             if (err) {
+@@ -59,3 +91,4 @@ QList<Controller*> BulkEnumerator::queryDevices() {
+     libusb_free_device_list(list, 1);
+     return m_devices;
+ }
++#include "moc_bulkenumerator.cpp"
+diff --git a/src/controllers/bulk/bulksupported.h b/src/controllers/bulk/bulksupported.h
+index 4d39b0d..75439a0 100644
+--- a/src/controllers/bulk/bulksupported.h
++++ b/src/controllers/bulk/bulksupported.h
+@@ -15,4 +15,5 @@ static bulk_supported_t bulk_supported[] = {
+         {0x06f8, 0xb107, 0x83, 0x03, 0}, // Hercules Mk4
+         {0x06f8, 0xb100, 0x86, 0x06, 0}, // Hercules Mk2
+         {0x06f8, 0xb120, 0x82, 0x03, 0}, // Hercules MP3 LE / Glow
++        {0x17cc, 0x1370, 0x00, 0x04, 6}, // Native Instruments Traktor Kontrol S8 displays
+         {0, 0, 0, 0, 0}};
+diff --git a/src/controllers/bulk/nativenis8displaycontract.h b/src/controllers/bulk/nativenis8displaycontract.h
+new file mode 100644
+index 0000000..7a516e7
+--- /dev/null
++++ b/src/controllers/bulk/nativenis8displaycontract.h
+@@ -0,0 +1,73 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <utility>
++
++/// Pure, hardware-free invariants shared by the Windows NI S8 transport and
++/// the Mission 264 offline contract test.
++namespace NativeNiS8DisplayContract {
++
++constexpr std::uint16_t kVendorId = 0x17cc;
++constexpr std::uint16_t kProductId = 0x1370;
++constexpr std::uint32_t kWriteBulkDataIoctl = 0x80892880;
++constexpr std::size_t kMinimumFrameBytes = 4;
++constexpr std::size_t kMaximumFrameBytes = 522264;
++constexpr std::size_t kMaximumPendingFrames = 2;
++
++constexpr bool isTargetDevice(std::uint16_t vendorId, std::uint16_t productId) {
++    return vendorId == kVendorId && productId == kProductId;
++}
++
++constexpr bool isValidFrameLength(std::size_t bytes) {
++    return bytes >= kMinimumFrameBytes && bytes <= kMaximumFrameBytes;
++}
++
++/// A fixed-depth, FIFO latest-frame queue. It retains the initial two S8
++/// screen frames while bounding later display backlog by dropping the oldest
++/// unsent frame when full.
++template<typename Frame, std::size_t Capacity = kMaximumPendingFrames>
++class BoundedLatestFrameQueue {
++  public:
++    static_assert(Capacity > 0);
++
++    bool empty() const {
++        return m_frames.empty();
++    }
++
++    std::size_t size() const {
++        return m_frames.size();
++    }
++
++    void clear() {
++        m_frames.clear();
++    }
++
++    void push(const Frame& frame) {
++        discardOldestIfFull();
++        m_frames.push_back(frame);
++    }
++
++    void push(Frame&& frame) {
++        discardOldestIfFull();
++        m_frames.push_back(std::move(frame));
++    }
++
++    Frame takeNext() {
++        Frame frame = std::move(m_frames.front());
++        m_frames.pop_front();
++        return frame;
++    }
++
++  private:
++    void discardOldestIfFull() {
++        if (m_frames.size() == Capacity) {
++            m_frames.pop_front();
++        }
++    }
++
++    std::deque<Frame> m_frames;
++};
++
++} // namespace NativeNiS8DisplayContract
+diff --git a/src/controllers/bulk/nativenis8displaytransport.cpp b/src/controllers/bulk/nativenis8displaytransport.cpp
+new file mode 100644
+index 0000000..d1e95bc
+--- /dev/null
++++ b/src/controllers/bulk/nativenis8displaytransport.cpp
+@@ -0,0 +1,647 @@
++#include "controllers/bulk/nativenis8displaytransport.h"
++#include "controllers/bulk/nativenis8displaycontract.h"
++
++#if defined(__WINDOWS__)
++
++#include <windows.h>
++#include <setupapi.h>
++
++#include <QElapsedTimer>
++#include <QMutex>
++#include <QThread>
++#include <QWaitCondition>
++
++#include <algorithm>
++#include <cwctype>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace {
++
++constexpr DWORD kWriteBulkDataIoctl =
++        static_cast<DWORD>(NativeNiS8DisplayContract::kWriteBulkDataIoctl);
++constexpr DWORD kWriteTimeoutMs = 250;
++constexpr unsigned long kOpenTimeoutMs = 3000;
++
++constexpr wchar_t kTargetPathNeedle[] = L"vid_17cc&pid_1370&mi_06";
++constexpr wchar_t kTargetInstancePrefix[] = L"USB\\VID_17CC&PID_1370&MI_06\\";
++constexpr wchar_t kTargetService[] = L"niks8usb";
++constexpr wchar_t kWriterMutexName[] = L"Local\\MixxxNativeNiS8DisplayTransport_17CC_1370_MI06";
++
++const GUID kNativeInstrumentsS8InterfaceGuid = {
++        0x1ff959f4,
++        0x8993,
++        0x4c52,
++        {0xa3, 0x97, 0x0c, 0xb9, 0x82, 0xc9, 0x19, 0x54}};
++
++class ScopedHandle {
++  public:
++    explicit ScopedHandle(HANDLE handle = INVALID_HANDLE_VALUE) : m_handle(handle) {
++    }
++
++    ~ScopedHandle() {
++        if (valid()) {
++            CloseHandle(m_handle);
++        }
++    }
++
++    ScopedHandle(const ScopedHandle&) = delete;
++    ScopedHandle& operator=(const ScopedHandle&) = delete;
++
++    bool valid() const {
++        return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr;
++    }
++
++    HANDLE get() const {
++        return m_handle;
++    }
++
++  private:
++    HANDLE m_handle;
++};
++
++class ScopedDeviceInfoSet {
++  public:
++    explicit ScopedDeviceInfoSet(HDEVINFO value = INVALID_HANDLE_VALUE) : m_value(value) {
++    }
++
++    ~ScopedDeviceInfoSet() {
++        if (m_value != INVALID_HANDLE_VALUE) {
++            SetupDiDestroyDeviceInfoList(m_value);
++        }
++    }
++
++    ScopedDeviceInfoSet(const ScopedDeviceInfoSet&) = delete;
++    ScopedDeviceInfoSet& operator=(const ScopedDeviceInfoSet&) = delete;
++
++    HDEVINFO get() const {
++        return m_value;
++    }
++
++  private:
++    HDEVINFO m_value;
++};
++
++class ScopedWriterLease {
++  public:
++    ScopedWriterLease() : m_handle(CreateMutexW(nullptr, FALSE, kWriterMutexName)) {
++        m_createError = m_handle == nullptr ? GetLastError() : ERROR_SUCCESS;
++    }
++
++    ~ScopedWriterLease() {
++        if (m_owned) {
++            ReleaseMutex(m_handle);
++        }
++        if (m_handle != nullptr) {
++            CloseHandle(m_handle);
++        }
++    }
++
++    ScopedWriterLease(const ScopedWriterLease&) = delete;
++    ScopedWriterLease& operator=(const ScopedWriterLease&) = delete;
++
++    bool valid() const {
++        return m_handle != nullptr;
++    }
++
++    DWORD createError() const {
++        return m_createError;
++    }
++
++    DWORD acquire() {
++        const DWORD result = WaitForSingleObject(m_handle, 0);
++        if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
++            m_owned = true;
++        } else if (result == WAIT_FAILED) {
++            m_waitError = GetLastError();
++        }
++        return result;
++    }
++
++    DWORD waitError() const {
++        return m_waitError;
++    }
++
++  private:
++    HANDLE m_handle{nullptr};
++    bool m_owned{false};
++    DWORD m_createError{ERROR_SUCCESS};
++    DWORD m_waitError{ERROR_SUCCESS};
++};
++
++std::wstring lowerCase(std::wstring value) {
++    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t value) {
++        return static_cast<wchar_t>(std::towlower(value));
++    });
++    return value;
++}
++
++bool equalsInsensitive(const std::wstring& left, const wchar_t* right) {
++    return lowerCase(left) == lowerCase(right);
++}
++
++bool startsWithInsensitive(const std::wstring& value, const wchar_t* prefix) {
++    const std::wstring prefixString(prefix);
++    return value.size() >= prefixString.size() &&
++            equalsInsensitive(value.substr(0, prefixString.size()), prefix);
++}
++
++bool containsInsensitive(const std::wstring& value, const wchar_t* needle) {
++    return lowerCase(value).find(lowerCase(needle)) != std::wstring::npos;
++}
++
++QString systemError(DWORD error) {
++    wchar_t* buffer = nullptr;
++    const DWORD length = FormatMessageW(
++            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
++                    FORMAT_MESSAGE_IGNORE_INSERTS,
++            nullptr,
++            error,
++            0,
++            reinterpret_cast<wchar_t*>(&buffer),
++            0,
++            nullptr);
++    QString message = length == 0 || buffer == nullptr
++            ? QStringLiteral("Win32 error %1").arg(error)
++            : QString::fromWCharArray(buffer, static_cast<int>(length)).trimmed();
++    if (buffer != nullptr) {
++        LocalFree(buffer);
++    }
++    return message;
++}
++
++bool deviceRegistryString(
++        HDEVINFO deviceInfoSet,
++        SP_DEVINFO_DATA* deviceData,
++        DWORD property,
++        std::wstring* value) {
++    DWORD type = 0;
++    DWORD required = 0;
++    SetupDiGetDeviceRegistryPropertyW(
++            deviceInfoSet, deviceData, property, &type, nullptr, 0, &required);
++    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required < sizeof(wchar_t)) {
++        return false;
++    }
++
++    std::vector<BYTE> storage(required + sizeof(wchar_t), 0);
++    if (!SetupDiGetDeviceRegistryPropertyW(deviceInfoSet,
++                deviceData,
++                property,
++                &type,
++                storage.data(),
++                required,
++                nullptr)) {
++        return false;
++    }
++    *value = reinterpret_cast<const wchar_t*>(storage.data());
++    return true;
++}
++
++bool findUniqueTargetPath(std::wstring* path, QString* failure) {
++    ScopedDeviceInfoSet deviceInfoSet(SetupDiGetClassDevsW(
++            &kNativeInstrumentsS8InterfaceGuid,
++            nullptr,
++            nullptr,
++            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
++    if (deviceInfoSet.get() == INVALID_HANDLE_VALUE) {
++        *failure = QStringLiteral("SetupDiGetClassDevsW failed: %1")
++                           .arg(systemError(GetLastError()));
++        return false;
++    }
++
++    unsigned int matches = 0;
++    std::wstring candidatePath;
++    for (DWORD index = 0;; ++index) {
++        SP_DEVICE_INTERFACE_DATA interfaceData{};
++        interfaceData.cbSize = sizeof(interfaceData);
++        if (!SetupDiEnumDeviceInterfaces(deviceInfoSet.get(),
++                    nullptr,
++                    &kNativeInstrumentsS8InterfaceGuid,
++                    index,
++                    &interfaceData)) {
++            const DWORD error = GetLastError();
++            if (error == ERROR_NO_MORE_ITEMS) {
++                break;
++            }
++            *failure = QStringLiteral("SetupDiEnumDeviceInterfaces failed: %1")
++                               .arg(systemError(error));
++            return false;
++        }
++
++        DWORD required = 0;
++        SetupDiGetDeviceInterfaceDetailW(
++                deviceInfoSet.get(), &interfaceData, nullptr, 0, &required, nullptr);
++        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required == 0) {
++            *failure = QStringLiteral("SetupDiGetDeviceInterfaceDetailW size query failed: %1")
++                               .arg(systemError(GetLastError()));
++            return false;
++        }
++
++        std::vector<BYTE> storage(required, 0);
++        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(storage.data());
++        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
++        SP_DEVINFO_DATA deviceData{};
++        deviceData.cbSize = sizeof(deviceData);
++        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfoSet.get(),
++                    &interfaceData,
++                    detail,
++                    required,
++                    nullptr,
++                    &deviceData)) {
++            *failure = QStringLiteral("SetupDiGetDeviceInterfaceDetailW failed: %1")
++                               .arg(systemError(GetLastError()));
++            return false;
++        }
++
++        std::vector<wchar_t> instanceIdBuffer(1024, L'\0');
++        if (!SetupDiGetDeviceInstanceIdW(deviceInfoSet.get(),
++                    &deviceData,
++                    instanceIdBuffer.data(),
++                    static_cast<DWORD>(instanceIdBuffer.size()),
++                    nullptr)) {
++            *failure = QStringLiteral("SetupDiGetDeviceInstanceIdW failed: %1")
++                               .arg(systemError(GetLastError()));
++            return false;
++        }
++
++        const std::wstring devicePath(detail->DevicePath);
++        const std::wstring instanceId(instanceIdBuffer.data());
++        if (!containsInsensitive(devicePath, kTargetPathNeedle) ||
++                !startsWithInsensitive(instanceId, kTargetInstancePrefix)) {
++            continue;
++        }
++
++        std::wstring service;
++        if (!deviceRegistryString(
++                    deviceInfoSet.get(), &deviceData, SPDRP_SERVICE, &service) ||
++                !equalsInsensitive(service, kTargetService)) {
++            *failure = QStringLiteral("MI_06 candidate is not bound to niks8usb");
++            return false;
++        }
++
++        ++matches;
++        candidatePath = devicePath;
++    }
++
++    if (matches != 1) {
++        *failure = QStringLiteral("Expected exactly one S8 MI_06 interface, found %1").arg(matches);
++        return false;
++    }
++
++    *path = std::move(candidatePath);
++    return true;
++}
++
++} // namespace
++
++class NativeNiS8DisplayTransport::Writer final : public QThread {
++  public:
++    Writer() = default;
++
++    ~Writer() override {
++        stopAndWait();
++    }
++
++    bool startAndWait(QString* failure) {
++        QMutexLocker locker(&m_mutex);
++        QThread::start();
++        QElapsedTimer startupTimer;
++        startupTimer.start();
++        while (!m_startupComplete) {
++            const qint64 elapsedMs = startupTimer.elapsed();
++            const unsigned long remainingMs = elapsedMs >= kOpenTimeoutMs
++                    ? 0
++                    : static_cast<unsigned long>(kOpenTimeoutMs - elapsedMs);
++            if (remainingMs == 0 || !m_startupReady.wait(&m_mutex, remainingMs)) {
++                m_stopRequested = true;
++                m_frameAvailable.wakeAll();
++                *failure = QStringLiteral("Timed out waiting for the native S8 display writer to open");
++                locker.unlock();
++                wait();
++                return false;
++            }
++        }
++
++        if (!m_open) {
++            *failure = m_lastFailure;
++            locker.unlock();
++            wait();
++            return false;
++        }
++        return true;
++    }
++
++    bool enqueue(const QByteArray& frame, QString* failure) {
++        if (frame.size() < static_cast<int>(NativeNiS8DisplayContract::kMinimumFrameBytes)) {
++            *failure = QStringLiteral("Refusing an S8 display frame shorter than the driver minimum");
++            return false;
++        }
++        if (frame.size() > static_cast<int>(NativeNiS8DisplayContract::kMaximumFrameBytes)) {
++            *failure = QStringLiteral("Refusing an S8 display frame larger than the encoder maximum");
++            return false;
++        }
++
++        QMutexLocker locker(&m_mutex);
++        if (!m_open || m_stopRequested || m_writeFaulted) {
++            *failure = m_lastFailure.isEmpty()
++                    ? QStringLiteral("Native S8 display writer is not open")
++                    : m_lastFailure;
++            return false;
++        }
++
++        // Retain at most the two freshest frames. The S8 mapping primes screen
++        // 0 and screen 1 synchronously at startup; a one-slot queue could lose
++        // the first frame before this worker wakes. Once both slots are used,
++        // discard the oldest unsent frame so a slow or disconnected device
++        // cannot build an unbounded backlog.
++        m_pendingFrames.push(frame);
++        m_frameAvailable.wakeOne();
++        return true;
++    }
++
++    void stopAndWait() {
++        {
++            QMutexLocker locker(&m_mutex);
++            m_stopRequested = true;
++            m_pendingFrames.clear();
++            m_frameAvailable.wakeAll();
++
++            // The writer may be blocked in the NI driver with an overlapped
++            // DeviceIoControl request. Waking the frame condition alone does
++            // not release that wait, so cancel the exact in-flight request.
++            // The OVERLAPPED and device handle remain owned by the writer
++            // thread until wait() below confirms that it has unwound.
++            if (m_activeOverlapped != nullptr && m_handle != INVALID_HANDLE_VALUE) {
++                const BOOL cancelled = CancelIoEx(m_handle, m_activeOverlapped);
++                const DWORD cancelError = cancelled ? ERROR_SUCCESS : GetLastError();
++                if (!cancelled && cancelError != ERROR_NOT_FOUND) {
++                    m_lastFailure = QStringLiteral(
++                            "CancelIoEx while stopping the S8 display writer failed: %1")
++                                            .arg(systemError(cancelError));
++                    m_writeFaulted = true;
++                }
++            }
++        }
++        wait();
++    }
++
++  protected:
++    void run() override {
++        std::wstring devicePath;
++        QString openFailure;
++        if (!findUniqueTargetPath(&devicePath, &openFailure)) {
++            finishStartup(false, openFailure);
++            return;
++        }
++
++        // One native writer owns the one MI_06 display path. The named lease
++        // protects against a duplicate controller object or a second Mixxx
++        // process without changing the driver-proven CreateFileW share flags.
++        ScopedWriterLease writerLease;
++        if (!writerLease.valid()) {
++            finishStartup(false,
++                    QStringLiteral("CreateMutexW for S8 MI_06 writer lease failed: %1")
++                            .arg(systemError(writerLease.createError())));
++            return;
++        }
++        const DWORD leaseResult = writerLease.acquire();
++        if (leaseResult == WAIT_TIMEOUT) {
++            finishStartup(false,
++                    QStringLiteral("S8 MI_06 native display writer is already owned by another process"));
++            return;
++        }
++        if (leaseResult == WAIT_FAILED) {
++            finishStartup(false,
++                    QStringLiteral("WaitForSingleObject for S8 MI_06 writer lease failed: %1")
++                            .arg(systemError(writerLease.waitError())));
++            return;
++        }
++
++        const HANDLE handle = CreateFileW(devicePath.c_str(),
++                GENERIC_READ | GENERIC_WRITE,
++                FILE_SHARE_READ | FILE_SHARE_WRITE,
++                nullptr,
++                OPEN_EXISTING,
++                FILE_FLAG_OVERLAPPED,
++                nullptr);
++        if (handle == INVALID_HANDLE_VALUE) {
++            finishStartup(false,
++                    QStringLiteral("CreateFileW for S8 MI_06 failed: %1")
++                            .arg(systemError(GetLastError())));
++            return;
++        }
++
++        {
++            QMutexLocker locker(&m_mutex);
++            m_handle = handle;
++            m_open = true;
++            m_startupComplete = true;
++            m_startupReady.wakeAll();
++        }
++
++        for (;;) {
++            QByteArray frame;
++            {
++                QMutexLocker locker(&m_mutex);
++                while (!m_stopRequested && !m_writeFaulted && m_pendingFrames.empty()) {
++                    m_frameAvailable.wait(&m_mutex);
++                }
++                if (m_stopRequested || m_writeFaulted) {
++                    // A rejected, disconnected, or timed-out request makes the
++                    // current handle terminal. Do not issue queued follow-up
++                    // IOCTLs against it; reopening is the recovery boundary.
++                    m_pendingFrames.clear();
++                    break;
++                }
++                frame = m_pendingFrames.takeNext();
++            }
++            writeFrame(frame);
++        }
++
++        CloseHandle(handle);
++        QMutexLocker locker(&m_mutex);
++        m_handle = INVALID_HANDLE_VALUE;
++        m_open = false;
++    }
++
++  private:
++    void finishStartup(bool open, const QString& failure) {
++        QMutexLocker locker(&m_mutex);
++        m_open = open;
++        m_startupComplete = true;
++        m_lastFailure = failure;
++        m_startupReady.wakeAll();
++    }
++
++    void recordFailure(const QString& failure) {
++        QMutexLocker locker(&m_mutex);
++        m_lastFailure = failure;
++        // A driver rejection or timeout is terminal for this open handle. This
++        // prevents a fast renderer or a future caller from turning one failed
++        // native request into a tight retry loop. Reopen is the explicit
++        // recovery boundary.
++        m_writeFaulted = true;
++    }
++
++    void completeCancelledOperation(HANDLE handle, OVERLAPPED* overlapped) {
++        const BOOL cancelResult = CancelIoEx(handle, overlapped);
++        const DWORD cancelError = cancelResult ? ERROR_SUCCESS : GetLastError();
++
++        // The frame and OVERLAPPED are stack-owned. Their lifetime and the
++        // handle are preserved until the driver confirms completion, including
++        // the uncommon case in which cancellation races a natural completion.
++        DWORD bytesReturned = 0;
++        const BOOL completion = GetOverlappedResult(handle, overlapped, &bytesReturned, TRUE);
++        const DWORD completionError = completion ? ERROR_SUCCESS : GetLastError();
++        if (!completion && completionError != ERROR_OPERATION_ABORTED) {
++            recordFailure(QStringLiteral("S8 display cancellation completion failed: %1")
++                                  .arg(systemError(completionError)));
++        } else if (!cancelResult && cancelError != ERROR_NOT_FOUND) {
++            recordFailure(QStringLiteral("CancelIoEx for S8 display frame failed: %1")
++                                  .arg(systemError(cancelError)));
++        }
++    }
++
++    void writeFrame(const QByteArray& frame) {
++        const ScopedHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
++        if (!event.valid()) {
++            recordFailure(QStringLiteral("CreateEventW for S8 display frame failed: %1")
++                                  .arg(systemError(GetLastError())));
++            return;
++        }
++
++        OVERLAPPED overlapped{};
++        overlapped.hEvent = event.get();
++        {
++            QMutexLocker locker(&m_mutex);
++            if (m_stopRequested) {
++                return;
++            }
++            m_activeOverlapped = &overlapped;
++        }
++        DWORD bytesReturned = 0;
++        const BOOL immediate = DeviceIoControl(m_handle,
++                kWriteBulkDataIoctl,
++                const_cast<char*>(frame.constData()),
++                static_cast<DWORD>(frame.size()),
++                nullptr,
++                0,
++                &bytesReturned,
++                &overlapped);
++        if (immediate) {
++            clearActiveOverlapped(&overlapped);
++            return;
++        }
++
++        const DWORD ioctlError = GetLastError();
++        if (ioctlError != ERROR_IO_PENDING) {
++            clearActiveOverlapped(&overlapped);
++            recordFailure(QStringLiteral("DeviceIoControl(0x80892880) failed: %1")
++                                  .arg(systemError(ioctlError)));
++            return;
++        }
++
++        const DWORD waitResult = WaitForSingleObject(event.get(), kWriteTimeoutMs);
++        if (waitResult == WAIT_OBJECT_0) {
++            const BOOL completed = GetOverlappedResult(m_handle, &overlapped, &bytesReturned, FALSE);
++            clearActiveOverlapped(&overlapped);
++            if (!completed) {
++                const DWORD completionError = GetLastError();
++                QMutexLocker locker(&m_mutex);
++                if (!(m_stopRequested && completionError == ERROR_OPERATION_ABORTED)) {
++                    m_lastFailure = QStringLiteral(
++                            "GetOverlappedResult for S8 display frame failed: %1")
++                                            .arg(systemError(completionError));
++                    m_writeFaulted = true;
++                }
++            }
++            return;
++        }
++
++        if (waitResult == WAIT_TIMEOUT) {
++            completeCancelledOperation(m_handle, &overlapped);
++            clearActiveOverlapped(&overlapped);
++            recordFailure(QStringLiteral("S8 display frame timed out after %1 ms; cancellation completion was awaited")
++                                  .arg(kWriteTimeoutMs));
++            return;
++        }
++
++        const DWORD waitError = GetLastError();
++        completeCancelledOperation(m_handle, &overlapped);
++        clearActiveOverlapped(&overlapped);
++        recordFailure(QStringLiteral("WaitForSingleObject for S8 display frame failed: %1")
++                              .arg(systemError(waitError)));
++    }
++
++    void clearActiveOverlapped(OVERLAPPED* overlapped) {
++        QMutexLocker locker(&m_mutex);
++        if (m_activeOverlapped == overlapped) {
++            m_activeOverlapped = nullptr;
++        }
++    }
++
++    QMutex m_mutex;
++    QWaitCondition m_startupReady;
++    QWaitCondition m_frameAvailable;
++    bool m_startupComplete = false;
++    bool m_open = false;
++    bool m_stopRequested = false;
++    bool m_writeFaulted = false;
++    HANDLE m_handle = INVALID_HANDLE_VALUE;
++    OVERLAPPED* m_activeOverlapped = nullptr;
++    NativeNiS8DisplayContract::BoundedLatestFrameQueue<QByteArray> m_pendingFrames;
++    QString m_lastFailure;
++};
++
++NativeNiS8DisplayTransport::NativeNiS8DisplayTransport() = default;
++
++NativeNiS8DisplayTransport::~NativeNiS8DisplayTransport() {
++    close();
++}
++
++bool NativeNiS8DisplayTransport::isTargetDevice(unsigned short vendorId, unsigned short productId) {
++    return NativeNiS8DisplayContract::isTargetDevice(vendorId, productId);
++}
++
++bool NativeNiS8DisplayTransport::hasUniqueTarget(QString* failure) {
++    std::wstring unusedPath;
++    return findUniqueTargetPath(&unusedPath, failure);
++}
++
++bool NativeNiS8DisplayTransport::open(QString* failure) {
++    std::lock_guard<std::mutex> locker(m_mutex);
++    if (m_pWriter) {
++        *failure = QStringLiteral("Native S8 display transport is already open");
++        return false;
++    }
++
++    auto writer = std::make_unique<Writer>();
++    if (!writer->startAndWait(failure)) {
++        return false;
++    }
++    m_pWriter = std::move(writer);
++    return true;
++}
++
++bool NativeNiS8DisplayTransport::enqueueFrame(const QByteArray& frame, QString* failure) {
++    std::lock_guard<std::mutex> locker(m_mutex);
++    if (!m_pWriter) {
++        *failure = QStringLiteral("Native S8 display transport is not open");
++        return false;
++    }
++    return m_pWriter->enqueue(frame, failure);
++}
++
++void NativeNiS8DisplayTransport::close() {
++    std::unique_ptr<Writer> writer;
++    {
++        std::lock_guard<std::mutex> locker(m_mutex);
++        writer = std::move(m_pWriter);
++    }
++    if (writer) {
++        writer->stopAndWait();
++    }
++}
++
++#endif
+diff --git a/src/controllers/bulk/nativenis8displaytransport.h b/src/controllers/bulk/nativenis8displaytransport.h
+new file mode 100644
+index 0000000..24cc3f8
+--- /dev/null
++++ b/src/controllers/bulk/nativenis8displaytransport.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#if defined(__WINDOWS__)
++
++#include <QByteArray>
++#include <QString>
++
++#include <memory>
++#include <mutex>
++
++/// Native Windows transport for the Traktor Kontrol S8 display interface.
++///
++/// The S8 display interface is owned by the Native Instruments driver, not by
++/// libusb. This class is intentionally limited to the S8 VID/PID and to the
++/// MI_06 device interface published by niks8usb.sys.
++class NativeNiS8DisplayTransport {
++  public:
++    NativeNiS8DisplayTransport();
++    ~NativeNiS8DisplayTransport();
++
++    NativeNiS8DisplayTransport(const NativeNiS8DisplayTransport&) = delete;
++    NativeNiS8DisplayTransport& operator=(const NativeNiS8DisplayTransport&) = delete;
++
++    static bool isTargetDevice(unsigned short vendorId, unsigned short productId);
++    static bool hasUniqueTarget(QString* failure);
++
++    bool open(QString* failure);
++    bool enqueueFrame(const QByteArray& frame, QString* failure);
++    void close();
++
++  private:
++    class Writer;
++
++    std::mutex m_mutex;
++    std::unique_ptr<Writer> m_pWriter;
++};
++
++#endif
+diff --git a/src/controllers/controllermanager.cpp b/src/controllers/controllermanager.cpp
+index 37d5796..c0df8bf 100644
+--- a/src/controllers/controllermanager.cpp
++++ b/src/controllers/controllermanager.cpp
+@@ -1,12 +1,16 @@
+ #include "controllers/controllermanager.h"
+ 
++#include <iterator>
++
+ #include <QSet>
+ #include <QThread>
+ 
++#include "control/controlobject.h"
+ #include "controllers/controller.h"
+ #include "controllers/controllerlearningeventfilter.h"
+ #include "controllers/controllermappinginfoenumerator.h"
+ #include "controllers/defs_controllers.h"
++#include "controllers/scripting/legacy/controllerscriptinterfacelegacy.h"
+ #include "moc_controllermanager.cpp"
+ #include "util/cmdlineargs.h"
+ #include "util/compatibility/qmutex.h"
+@@ -95,6 +99,149 @@ ControllerManager::ControllerManager(UserSettingsPointer pConfig)
+           m_pControllerLearningEventFilter(new ControllerLearningEventFilter()),
+           m_pollTimer(this),
+           m_skipPoll(false) {
++    ControllerScriptInterfaceLegacy::configureS8Preferences(pConfig.toWeakRef());
++    // Legacy HID and Bulk mappings use independent JavaScript engines. These
++    // controls bridge only the bounded S8 surface context that is not already
++    // represented by authoritative Mixxx ControlObjects.
++    const ConfigKey bridgeKeys[] = {
++            ConfigKey("[S8Display]", "left_deck"),
++            ConfigKey("[S8Display]", "right_deck"),
++            ConfigKey("[S8Display]", "left_context"),
++            ConfigKey("[S8Display]", "right_context"),
++            ConfigKey("[S8Display]", "left_touch_mask"),
++            ConfigKey("[S8Display]", "right_touch_mask"),
++            ConfigKey("[S8Display]", "left_fx_slot"),
++            ConfigKey("[S8Display]", "right_fx_slot"),
++            ConfigKey("[S8Display]", "left_pad_mode"),
++            ConfigKey("[S8Display]", "right_pad_mode"),
++            ConfigKey("[S8Display]", "left_generation"),
++            ConfigKey("[S8Display]", "right_generation"),
++            ConfigKey("[S8Display]", "left_state_revision"),
++            ConfigKey("[S8Display]", "right_state_revision"),
++            ConfigKey("[S8Display]", "left_view_mode"),
++            ConfigKey("[S8Display]", "right_view_mode"),
++            ConfigKey("[S8Display]", "left_waveform_mode"),
++            ConfigKey("[S8Display]", "right_waveform_mode"),
++            ConfigKey("[S8Display]", "left_information_overlay"),
++            ConfigKey("[S8Display]", "right_information_overlay"),
++            ConfigKey("[S8Display]", "left_stems_page"),
++            ConfigKey("[S8Display]", "right_stems_page"),
++            ConfigKey("[S8Display]", "left_active_panel"),
++            ConfigKey("[S8Display]", "right_active_panel"),
++            ConfigKey("[S8Display]", "left_settings_open"),
++            ConfigKey("[S8Display]", "right_settings_open"),
++            ConfigKey("[S8Display]", "left_waveform_zoom"),
++            ConfigKey("[S8Display]", "right_waveform_zoom"),
++            ConfigKey("[S8Display]", "left_mixer_fx_product"),
++            ConfigKey("[S8Display]", "right_mixer_fx_product"),
++            ConfigKey("[S8Display]", "left_connected"),
++              ConfigKey("[S8Display]", "right_connected"),
++              ConfigKey("[S8Display]", "left_slice_1"),
++              ConfigKey("[S8Display]", "right_slice_1"),
++              ConfigKey("[S8Display]", "left_slice_2"),
++              ConfigKey("[S8Display]", "right_slice_2"),
++              ConfigKey("[S8Display]", "left_slice_3"),
++              ConfigKey("[S8Display]", "right_slice_3"),
++              ConfigKey("[S8Display]", "left_slice_4"),
++              ConfigKey("[S8Display]", "right_slice_4"),
++              ConfigKey("[S8Display]", "left_slice_5"),
++              ConfigKey("[S8Display]", "right_slice_5"),
++              ConfigKey("[S8Display]", "left_slice_6"),
++              ConfigKey("[S8Display]", "right_slice_6"),
++              ConfigKey("[S8Display]", "left_slice_7"),
++              ConfigKey("[S8Display]", "right_slice_7"),
++              ConfigKey("[S8Display]", "left_slice_8"),
++              ConfigKey("[S8Display]", "right_slice_8"),
++              ConfigKey("[S8Display]", "left_slice_end"),
++              ConfigKey("[S8Display]", "right_slice_end"),
++              ConfigKey("[S8Display]", "left_slice_beats"),
++              ConfigKey("[S8Display]", "right_slice_beats"),
++              ConfigKey("[S8Display]", "left_slice_mask"),
++              ConfigKey("[S8Display]", "right_slice_mask"),
++              ConfigKey("[S8Display]", "left_sampler_bank"),
++              ConfigKey("[S8Display]", "right_sampler_bank"),
++              ConfigKey("[S8Display]", "left_slice_token"),
++              ConfigKey("[S8Display]", "right_slice_token"),
++              ConfigKey("[S8Display]", "left_master_tempo_popup"),
++              ConfigKey("[S8Display]", "right_master_tempo_popup"),
++              ConfigKey("[S8Display]", "left_master_tempo_bpm"),
++              ConfigKey("[S8Display]", "right_master_tempo_bpm"),
++              ConfigKey("[S8Display]", "left_load_status"),
++              ConfigKey("[S8Display]", "right_load_status"),
++              ConfigKey("[S8Display]", "left_settings_page"),
++              ConfigKey("[S8Display]", "right_settings_page"),
++              ConfigKey("[S8Display]", "left_sort_popup"),
++              ConfigKey("[S8Display]", "right_sort_popup"),
++              ConfigKey("[S8Display]", "left_load_reject_reason"),
++              ConfigKey("[S8Display]", "right_load_reject_reason"),
++              ConfigKey("[S8Display]", "left_popup_kind"),
++              ConfigKey("[S8Display]", "right_popup_kind"),
++              ConfigKey("[S8Display]", "left_popup_phase"),
++              ConfigKey("[S8Display]", "right_popup_phase"),
++              ConfigKey("[S8Display]", "left_popup_title"),
++              ConfigKey("[S8Display]", "right_popup_title"),
++              ConfigKey("[S8Display]", "left_popup_value"),
++              ConfigKey("[S8Display]", "right_popup_value"),
++              ConfigKey("[S8Display]", "left_popup_has_value"),
++              ConfigKey("[S8Display]", "right_popup_has_value"),
++              ConfigKey("[S8Display]", "left_popup_deck"),
++              ConfigKey("[S8Display]", "right_popup_deck"),
++              ConfigKey("[S8Display]", "left_popup_master"),
++              ConfigKey("[S8Display]", "right_popup_master"),
++              ConfigKey("[S8Display]", "left_popup_pending_index"),
++              ConfigKey("[S8Display]", "right_popup_pending_index"),
++              ConfigKey("[S8Display]", "left_popup_pending_descending"),
++              ConfigKey("[S8Display]", "right_popup_pending_descending"),
++              ConfigKey("[S8Display]", "left_popup_pending_criteria"),
++              ConfigKey("[S8Display]", "right_popup_pending_criteria")};
++    const double bridgeDefaults[] = {
++            1.0, 2.0, // focused decks
++            0.0, 0.0, // DECK context
++            0.0, 0.0, // no capacitive touch
++            1.0, 1.0, // FX slot 1
++            0.0, 0.0, // HOTCUE pad mode
++            0.0, 0.0, // disconnected generation
++            0.0, 0.0, // state revision
++            0.0, 0.0, // DECK_VIEW_SINGLE
++            0.0, 0.0, // WAVEFORM_EXPANDED
++            0.0, 0.0, // OVERLAY_NONE
++            0.0, 0.0, // STEM_FILTER
++            0.0, 0.0, // no active context panel
++            0.0, 0.0, // settings closed
++            7.0, 7.0, // QML reference waveform zoom default
++            0.0, 0.0, // FILTER product state
++              0.0, 0.0, // bridge disconnected until IF5 snapshot
++              0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // slice boundaries 1..3
++              0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // slice boundaries 4..6
++              0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // slice boundaries 7..end
++              0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // beats, pressed mask, bank
++              0.0, 0.0, // track identity tokens
++              0.0, 0.0, // master tempo popup closed
++              124.0, 124.0, // master tempo BPM
++              0.0, 0.0, // no pending/rejected browser load
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0,
++              0.0, 0.0
++    };
++    static_assert(std::size(bridgeKeys) == std::size(bridgeDefaults));
++    static_assert(std::size(bridgeKeys) ==
++            std::tuple_size<decltype(m_s8DisplayBridgeControls)>::value);
++    for (std::size_t i = 0; i < m_s8DisplayBridgeControls.size(); ++i) {
++        m_s8DisplayBridgeControls[i] =
++                std::make_unique<ControlObject>(bridgeKeys[i], true);
++        m_s8DisplayBridgeControls[i]->setAndConfirm(bridgeDefaults[i]);
++    }
++
+     qRegisterMetaType<std::shared_ptr<LegacyControllerMapping>>(
+             "std::shared_ptr<LegacyControllerMapping>");
+ 
+@@ -135,6 +282,7 @@ ControllerManager::~ControllerManager() {
+     m_pThread->wait();
+     delete m_pThread;
+     delete m_pControllerLearningEventFilter;
++    ControllerScriptInterfaceLegacy::configureS8Preferences(UserSettingsWeakPointer());
+ }
+ 
+ ControllerLearningEventFilter* ControllerManager::getControllerLearningEventFilter() const {
+diff --git a/src/controllers/controllermanager.h b/src/controllers/controllermanager.h
+index ded4d29..7dfbf1f 100644
+--- a/src/controllers/controllermanager.h
++++ b/src/controllers/controllermanager.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <array>
+ #include <QMutex>
+ #include <QSharedPointer>
+ #include <QTimer>
+@@ -15,6 +16,7 @@ class ControllerLearningEventFilter;
+ class MappingInfoEnumerator;
+ class LegacyControllerMapping;
+ class ControllerEnumerator;
++class ControlObject;
+ 
+ /// Function to sort controllers by name
+ bool controllerCompare(Controller *a, Controller *b);
+@@ -86,4 +88,5 @@ class ControllerManager : public QObject {
+     QSharedPointer<MappingInfoEnumerator> m_pMainThreadUserMappingEnumerator;
+     QSharedPointer<MappingInfoEnumerator> m_pMainThreadSystemMappingEnumerator;
+     bool m_skipPoll;
++    std::array<std::unique_ptr<ControlObject>, 90> m_s8DisplayBridgeControls;
+ };
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+index 3efe12d..e6c1b25 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+@@ -1,19 +1,306 @@
+ #include "controllerscriptinterfacelegacy.h"
+ 
++#include <QApplication>
++#include <QHeaderView>
++#include <QThread>
++#include <QtMath>
++#include <cmath>
++#include <QMutexLocker>
++#include <QtConcurrent/QtConcurrentRun>
++#include <QRegularExpression>
++#include "track/beats.h"
++#include "track/keyutils.h"
++
+ #include "control/controlobject.h"
+ #include "control/controlobjectscript.h"
+ #include "controllers/scripting/legacy/controllerscriptenginelegacy.h"
+ #include "controllers/scripting/legacy/scriptconnectionjsproxy.h"
++#include "effects/effectsmanager.h"
+ #include "mixer/playermanager.h"
++#include "mixer/playerinfo.h"
+ #include "moc_controllerscriptinterfacelegacy.cpp"
++#include "track/track.h"
++#include "library/trackmodel.h"
+ #include "util/fpclassify.h"
+ #include "util/make_const_iterator.h"
+ #include "util/time.h"
++#include "widget/wlibrary.h"
++#include "widget/wlibrarysidebar.h"
++#include "widget/wtracktableview.h"
+ 
+ #define SCRATCH_DEBUG_OUTPUT false
+ 
+ namespace {
+ constexpr int kDecks = 16;
++constexpr int kS8WaveformBins = 444;
++constexpr int kS8OverviewBins = 120;
++struct S8SliceIdentity {
++    TrackWeakPointer track;
++    quint64 token = 0;
++};
++QMutex s_s8SliceMutex;
++QHash<QString, S8SliceIdentity> s_s8SliceIdentities;
++quint64 s_s8SliceToken = 0;
++QMutex s_s8PreferencesMutex;
++UserSettingsWeakPointer s_s8Preferences;
++
++struct S8PreferenceRange {
++    double minimum;
++    double maximum;
++};
++
++const QHash<QString, S8PreferenceRange> kS8PreferenceRanges{
++        {QStringLiteral("fx_unit_1_mode"), {0, 1}},
++        {QStringLiteral("fx_unit_2_mode"), {0, 1}},
++        {QStringLiteral("fx_unit_3_mode"), {0, 1}},
++        {QStringLiteral("fx_unit_4_mode"), {0, 1}},
++        {QStringLiteral("browser_rows"), {4, 9}},
++        {QStringLiteral("waveform_style"), {0, 3}},
++        {QStringLiteral("bpm_precision"), {1, 2}},
++        {QStringLiteral("preview_seek_seconds"), {1, 30}},
++        {QStringLiteral("pad_palette"), {0, 3}}};
++
++QString s8PreferenceItem(const QString& name) {
++    return QStringLiteral("S8_%1").arg(name);
++}
++
++QVariantList downsampleWaveform(const ConstWaveformPointer& pWaveform, int maxBins) {
++    QVariantList result;
++    if (!pWaveform || maxBins <= 0) {
++        return result;
++    }
++    const int available = qBound(0,
++            pWaveform->getCompletion(),
++            pWaveform->getDataSize());
++    if (available <= 0) {
++        return result;
++    }
++    const int bins = qMin(maxBins, available);
++    result.reserve(bins);
++    for (int bin = 0; bin < bins; ++bin) {
++        const int begin = (bin * available) / bins;
++        const int end = qMax(begin + 1, ((bin + 1) * available) / bins);
++        int low = 0;
++        int mid = 0;
++        int high = 0;
++        int peak = 0;
++        for (int index = begin; index < end; ++index) {
++            low = qMax(low, static_cast<int>(pWaveform->getLow(index)));
++            mid = qMax(mid, static_cast<int>(pWaveform->getMid(index)));
++            high = qMax(high, static_cast<int>(pWaveform->getHigh(index)));
++            peak = qMax(peak, static_cast<int>(pWaveform->getAll(index)));
++        }
++        result.append(QVariantMap{
++                {QStringLiteral("low"), low / 255.0},
++                {QStringLiteral("mid"), mid / 255.0},
++                {QStringLiteral("high"), high / 255.0},
++                {QStringLiteral("peak"), peak / 255.0}});
++    }
++    return result;
++}
++
++QVariantList downsampleWaveformWindow(const ConstWaveformPointer& pWaveform,
++        int bins,
++        double centerPosition,
++        double windowFraction) {
++    QVariantList result;
++    if (!pWaveform || bins <= 0) {
++        return result;
++    }
++    const int available = qBound(0,
++            pWaveform->getCompletion(),
++            pWaveform->getDataSize());
++    if (available <= 0) {
++        return result;
++    }
++
++    const double span = qBound(0.001, windowFraction, 1.0);
++    const double start = centerPosition - span / 2.0;
++    result.reserve(bins);
++    for (int bin = 0; bin < bins; ++bin) {
++        const double binStart = start + span * bin / bins;
++        const double binEnd = start + span * (bin + 1) / bins;
++        const int begin = qBound(0,
++                static_cast<int>(qFloor(binStart * available)),
++                available);
++        const int end = qBound(0,
++                static_cast<int>(qCeil(binEnd * available)),
++                available);
++        int low = 0;
++        int mid = 0;
++        int high = 0;
++        int peak = 0;
++        for (int index = begin; index < end; ++index) {
++            low = qMax(low, static_cast<int>(pWaveform->getLow(index)));
++            mid = qMax(mid, static_cast<int>(pWaveform->getMid(index)));
++            high = qMax(high, static_cast<int>(pWaveform->getHigh(index)));
++            peak = qMax(peak, static_cast<int>(pWaveform->getAll(index)));
++        }
++        result.append(QVariantMap{
++                {QStringLiteral("low"), low / 255.0},
++                {QStringLiteral("mid"), mid / 255.0},
++                {QStringLiteral("high"), high / 255.0},
++                {QStringLiteral("peak"), peak / 255.0}});
++    }
++    return result;
++}
++
++QVariantMap browserStateOnGuiThread(int requestedVisibleRows) {
++    const int visibleRows = qBound(4, requestedVisibleRows, 9);
++    QVariantMap state{
++            {QStringLiteral("available"), false},
++            {QStringLiteral("mode"), QStringLiteral("tracks")},
++            {QStringLiteral("path"), QStringLiteral("BROWSER")},
++            {QStringLiteral("selectedIndex"), 0},
++            {QStringLiteral("visibleRows"), visibleRows},
++            {QStringLiteral("rows"), QVariantList()}};
++    auto* pApp = qobject_cast<QApplication*>(QCoreApplication::instance());
++    if (!pApp) {
++        return state;
++    }
++
++    WLibrary* pLibrary = nullptr;
++    WLibrarySidebar* pSidebar = nullptr;
++    for (QWidget* pTopLevel : pApp->topLevelWidgets()) {
++        if (!pLibrary) {
++            pLibrary = pTopLevel->findChild<WLibrary*>();
++        }
++        if (!pSidebar) {
++            pSidebar = pTopLevel->findChild<WLibrarySidebar*>();
++        }
++    }
++
++    QVariantList rows;
++    // The controller moves focus through the official Library ControlObject.
++    // QWidget::hasFocus() can briefly remain false while the focus event is
++    // queued, which made the S8 renderer inspect the old track table and report
++    // the browser as unavailable immediately after it was opened.
++    const bool sidebarSelected =
++            ControlObject::get(ConfigKey("[Library]", "focused_widget")) == 2.0;
++    if (pSidebar && (pSidebar->hasFocus() || sidebarSelected)) {
++        const QModelIndex selected = pSidebar->currentIndex();
++        const QModelIndex parent = selected.parent();
++        auto* pModel = pSidebar->model();
++        if (!pModel) {
++            return state;
++        }
++        const int count = pModel->rowCount(parent);
++        const int selectedRow = selected.isValid() ? selected.row() : 0;
++        const int first = qMax(0, qMin(selectedRow - visibleRows / 2, count - visibleRows));
++        for (int row = first; row < qMin(count, first + visibleRows); ++row) {
++            const QModelIndex index = pModel->index(row, 0, parent);
++            rows.append(QVariantMap{
++                    {QStringLiteral("type"), QStringLiteral("folder")},
++                    {QStringLiteral("title"), pModel->data(index, Qt::DisplayRole).toString()},
++                    {QStringLiteral("expandable"), pModel->hasChildren(index)}});
++        }
++        QStringList path;
++        for (QModelIndex index = parent; index.isValid(); index = index.parent()) {
++            path.prepend(pModel->data(index, Qt::DisplayRole).toString());
++        }
++        state[QStringLiteral("available")] = true;
++        state[QStringLiteral("mode")] = QStringLiteral("tree");
++        state[QStringLiteral("path")] = path.isEmpty()
++                ? QStringLiteral("BROWSER")
++                : path.join(QStringLiteral(" > "));
++        state[QStringLiteral("selectedIndex")] = selectedRow - first;
++        state[QStringLiteral("rows")] = rows;
++        return state;
++    }
++
++    if (!pLibrary) {
++        return state;
++    }
++    WTrackTableView* pTable = pLibrary->getCurrentTrackTableView();
++    if (!pTable) {
++        return state;
++    }
++    auto* pTrackModel = dynamic_cast<TrackModel*>(pTable->model());
++    if (!pTrackModel) {
++        return state;
++    }
++    const int count = pTable->model()->rowCount();
++    const int selectedRow = pTable->currentIndex().isValid()
++            ? pTable->currentIndex().row()
++            : 0;
++    const int first = qMax(0, qMin(selectedRow - visibleRows / 2, count - visibleRows));
++    for (int row = first; row < qMin(count, first + visibleRows); ++row) {
++        const QModelIndex index = pTable->model()->index(row, 0);
++        const TrackPointer pTrack = pTrackModel->getTrack(index);
++        if (!pTrack) {
++            rows.append(QVariantMap{{QStringLiteral("type"), QStringLiteral("track")}});
++            continue;
++        }
++        rows.append(QVariantMap{
++                {QStringLiteral("type"), QStringLiteral("track")},
++                {QStringLiteral("title"), pTrack->getTitle()},
++                {QStringLiteral("artist"), pTrack->getArtist()},
++                {QStringLiteral("bpm"), pTrack->getBpm()},
++                {QStringLiteral("key"), pTrack->getKeyText()},
++                {QStringLiteral("duration"), pTrack->getDuration()}});
++    }
++    const QModelIndex selectedIndex = pTable->currentIndex();
++    const TrackPointer pSelectedTrack = selectedIndex.isValid()
++            ? pTrackModel->getTrack(selectedIndex)
++            : TrackPointer();
++    state[QStringLiteral("available")] = true;
++    QStringList path{QStringLiteral("BROWSER")};
++    if (pSidebar && pSidebar->model()) {
++        QStringList selectedPath;
++        for (QModelIndex index = pSidebar->currentIndex(); index.isValid(); index = index.parent()) {
++            selectedPath.prepend(pSidebar->model()->data(index, Qt::DisplayRole).toString());
++        }
++        path.append(selectedPath);
++    } else {
++        path.append(QStringLiteral("LIBRARY"));
++    }
++    state[QStringLiteral("path")] = path.join(QStringLiteral(" > "));
++    state[QStringLiteral("selectedIndex")] = selectedRow - first;
++    state[QStringLiteral("selectedIdentity")] = pSelectedTrack
++            ? pSelectedTrack->getLocation()
++            : QString();
++    if (QHeaderView* pHeader = pTable->horizontalHeader()) {
++        const int section = pHeader->sortIndicatorSection();
++        state[QStringLiteral("sortColumnId")] = static_cast<int>(
++                pTrackModel->sortColumnIdFromColumnIndex(section));
++        state[QStringLiteral("sortLabel")] = section >= 0
++                ? pTable->model()->headerData(section, Qt::Horizontal, Qt::DisplayRole).toString()
++                : QString();
++        state[QStringLiteral("sortDescending")] =
++                pHeader->sortIndicatorOrder() == Qt::DescendingOrder;
++        QVariantList sortCriteria;
++        const TrackModel::SortColumnId s8SortCriteria[] = {
++                TrackModel::SortColumnId::Title,
++                TrackModel::SortColumnId::Artist,
++                TrackModel::SortColumnId::Bpm,
++                TrackModel::SortColumnId::DateTimeAdded,
++                TrackModel::SortColumnId::TrackNumber,
++                TrackModel::SortColumnId::Key,
++        };
++        for (const auto columnId : s8SortCriteria) {
++            const int column = pTrackModel->columnIndexFromSortColumnId(columnId);
++            if (column < 0 || !pTrackModel->isColumnSortable(column)) {
++                continue;
++            }
++            const QString label = pTable->model()
++                                          ->headerData(column, Qt::Horizontal, Qt::DisplayRole)
++                                          .toString();
++            if (!label.isEmpty()) {
++                sortCriteria.append(QVariantMap{
++                        {QStringLiteral("id"), static_cast<int>(columnId)},
++                        {QStringLiteral("label"), label}});
++            }
++        }
++        state[QStringLiteral("sortCriteria")] = sortCriteria;
++    }
++    state[QStringLiteral("previewPlaying")] =
++            ControlObject::get(ConfigKey("[PreviewDeck1]", "play")) > 0.0;
++    state[QStringLiteral("previewPosition")] = qBound(0.0,
++            ControlObject::get(ConfigKey("[PreviewDeck1]", "playposition")),
++            1.0);
++    state[QStringLiteral("rows")] = rows;
++    return state;
++}
+ 
+ // Use 1ms for the Alpha-Beta dt. We're assuming the OS actually gives us a 1ms
+ // timer.
+@@ -50,6 +337,13 @@ ControllerScriptInterfaceLegacy::ControllerScriptInterfaceLegacy(
+ }
+ 
+ ControllerScriptInterfaceLegacy::~ControllerScriptInterfaceLegacy() {
++    // Join at shutdown only, never on the audio/render path. Workers capture no
++    // QObject, but native cover decoders must finish before plugin teardown.
++    for (auto& entry : m_s8Artwork) {
++        if (entry.pendingActive) {
++            entry.pending.waitForFinished();
++        }
++    }
+     // Stop all timers
+     const auto timerIds = m_timers.keys();
+     for (const int timerId : timerIds) {
+@@ -91,6 +385,138 @@ ControllerScriptInterfaceLegacy::~ControllerScriptInterfaceLegacy() {
+     }
+ }
+ 
++void ControllerScriptInterfaceLegacy::configureS8Preferences(UserSettingsWeakPointer pConfig) {
++    QMutexLocker locker(&s_s8PreferencesMutex);
++    s_s8Preferences = std::move(pConfig);
++}
++
++double ControllerScriptInterfaceLegacy::getS8Preference(
++        const QString& name, double fallback) {
++    const auto range = kS8PreferenceRanges.constFind(name);
++    if (range == kS8PreferenceRanges.constEnd() || !std::isfinite(fallback)) {
++        return fallback;
++    }
++    UserSettingsPointer pConfig;
++    {
++        QMutexLocker locker(&s_s8PreferencesMutex);
++        pConfig = s_s8Preferences.toStrongRef();
++    }
++    if (!pConfig) {
++        return qBound(range->minimum, fallback, range->maximum);
++    }
++    const double value = pConfig->getValue<double>(
++            ConfigKey(QStringLiteral("[Controller]"), s8PreferenceItem(name)), fallback);
++    return qBound(range->minimum, value, range->maximum);
++}
++
++bool ControllerScriptInterfaceLegacy::setS8Preference(
++        const QString& name, double value) {
++    const auto range = kS8PreferenceRanges.constFind(name);
++    if (range == kS8PreferenceRanges.constEnd() || !std::isfinite(value) ||
++            value < range->minimum || value > range->maximum) {
++        return false;
++    }
++    UserSettingsPointer pConfig;
++    {
++        QMutexLocker locker(&s_s8PreferencesMutex);
++        pConfig = s_s8Preferences.toStrongRef();
++    }
++    if (!pConfig) {
++        return false;
++    }
++    pConfig->setValue(ConfigKey(QStringLiteral("[Controller]"), s8PreferenceItem(name)), value);
++    return true;
++}
++
++QVariantMap ControllerScriptInterfaceLegacy::getS8EffectState(int effectUnit) {
++    QVariantMap result{{QStringLiteral("available"), false}};
++    if (effectUnit < 1 || effectUnit > 4) {
++        return result;
++    }
++    const QVariantMap catalog = EffectsManager::s8ControllerEffectCatalog();
++    const QVariantList visibleEffects = catalog.value(QStringLiteral("visibleEffects")).toList();
++    const QVariantList chainPresets = catalog.value(QStringLiteral("chainPresets")).toList();
++    const QString unitGroup = QStringLiteral("[EffectRack1_EffectUnit%1]").arg(effectUnit);
++    const int loadedPreset = qRound(ControlObject::get(ConfigKey(unitGroup, "loaded_chain_preset")));
++    QVariantList effectSlots;
++    for (int slot = 1; slot <= 3; ++slot) {
++        const QString slotGroup = QStringLiteral("[EffectRack1_EffectUnit%1_Effect%2]")
++                                          .arg(effectUnit)
++                                          .arg(slot);
++        const int loadedEffect = qRound(ControlObject::get(ConfigKey(slotGroup, "loaded_effect")));
++        const QVariantMap manifest = loadedEffect > 0 && loadedEffect <= visibleEffects.size()
++                ? visibleEffects.at(loadedEffect - 1).toMap()
++                : QVariantMap{};
++        const QVariantList knobNames = manifest.value(QStringLiteral("knobParameters")).toList();
++        const int parameterCount = qBound(0,
++                qRound(ControlObject::get(ConfigKey(slotGroup, "num_parameters"))),
++                8);
++        QVariantList parameters;
++        for (int parameter = 1; parameter <= parameterCount; ++parameter) {
++            const QVariantMap metadata = parameter <= knobNames.size()
++                    ? knobNames.at(parameter - 1).toMap()
++                    : QVariantMap{};
++            parameters.append(QVariantMap{{QStringLiteral("name"),
++                                                  metadata.value(QStringLiteral("shortName"),
++                                                          metadata.value(QStringLiteral("name")))},
++                    {QStringLiteral("value"), ControlObject::get(ConfigKey(
++                                                              slotGroup,
++                                                              QStringLiteral("parameter%1").arg(parameter)))}});
++        }
++        effectSlots.append(QVariantMap{{QStringLiteral("slot"), slot},
++                {QStringLiteral("loadedEffect"), loadedEffect},
++                {QStringLiteral("name"), manifest.value(QStringLiteral("name"))},
++                {QStringLiteral("enabled"),
++                        ControlObject::get(ConfigKey(slotGroup, "enabled")) > 0.0},
++                {QStringLiteral("meta"), ControlObject::get(ConfigKey(slotGroup, "meta"))},
++                {QStringLiteral("parameters"), parameters}});
++    }
++    result = catalog;
++    result[QStringLiteral("available")] = !visibleEffects.isEmpty();
++    result[QStringLiteral("unit")] = effectUnit;
++    result[QStringLiteral("enabled")] = ControlObject::get(ConfigKey(unitGroup, "enabled")) > 0.0;
++    result[QStringLiteral("mix")] = ControlObject::get(ConfigKey(unitGroup, "mix"));
++    result[QStringLiteral("mixMode")] = ControlObject::get(ConfigKey(unitGroup, "mix_mode"));
++    result[QStringLiteral("loadedChainPreset")] = loadedPreset;
++    result[QStringLiteral("loadedChainPresetName")] =
++            loadedPreset >= 0 && loadedPreset < chainPresets.size()
++            ? chainPresets.at(loadedPreset)
++            : QVariant{};
++    result[QStringLiteral("slots")] = effectSlots;
++    return result;
++}
++
++bool ControllerScriptInterfaceLegacy::s8LoadEffect(
++        int effectUnit, int slot, int visibleEffectIndex) {
++    const QVariantList effects = EffectsManager::s8ControllerEffectCatalog()
++                                         .value(QStringLiteral("visibleEffects"))
++                                         .toList();
++    if (effectUnit < 1 || effectUnit > 4 || slot < 1 || slot > 3 ||
++            visibleEffectIndex < 0 || visibleEffectIndex >= effects.size()) {
++        return false;
++    }
++    ControlObject::set(ConfigKey(QStringLiteral("[EffectRack1_EffectUnit%1_Effect%2]")
++                                         .arg(effectUnit)
++                                         .arg(slot),
++                               "loaded_effect"),
++            visibleEffectIndex + 1);
++    return true;
++}
++
++bool ControllerScriptInterfaceLegacy::s8LoadChainPreset(int effectUnit, int presetIndex) {
++    const QVariantList presets = EffectsManager::s8ControllerEffectCatalog()
++                                         .value(QStringLiteral("chainPresets"))
++                                         .toList();
++    if (effectUnit < 1 || effectUnit > 4 || presetIndex < 0 || presetIndex >= presets.size()) {
++        return false;
++    }
++    ControlObject::set(ConfigKey(
++                               QStringLiteral("[EffectRack1_EffectUnit%1]").arg(effectUnit),
++                               "loaded_chain_preset"),
++            presetIndex);
++    return true;
++}
++
+ ControlObjectScript* ControllerScriptInterfaceLegacy::getControlObjectScript(
+         const QString& group, const QString& name) {
+     ConfigKey key = ConfigKey(group, name);
+@@ -131,6 +557,373 @@ QJSValue ControllerScriptInterfaceLegacy::getSetting(const QString& name) {
+     }
+ }
+ 
++QVariantMap ControllerScriptInterfaceLegacy::getTrackMetadata(const QString& group) {
++    QVariantMap metadata{
++            {QStringLiteral("loaded"), false},
++            {QStringLiteral("title"), QString()},
++            {QStringLiteral("artist"), QString()},
++            {QStringLiteral("album"), QString()},
++            {QStringLiteral("key"), QString()},
++            {QStringLiteral("duration"), 0.0}};
++
++    const TrackPointer pTrack = PlayerInfo::instance().getTrackInfo(group);
++    if (!pTrack) {
++        return metadata;
++    }
++
++    // PlayerInfo protects the group lookup and Track protects each getter.
++    metadata[QStringLiteral("loaded")] = true;
++    metadata[QStringLiteral("title")] = pTrack->getTitle();
++    metadata[QStringLiteral("artist")] = pTrack->getArtist();
++    metadata[QStringLiteral("album")] = pTrack->getAlbum();
++    metadata[QStringLiteral("originalKey")] = pTrack->getKeyText();
++    metadata[QStringLiteral("key")] = KeyUtils::keyToString(
++            KeyUtils::keyFromNumericValue(getValue(group, QStringLiteral("key"))));
++    metadata[QStringLiteral("duration")] = pTrack->getDuration();
++    metadata[QStringLiteral("identity")] = pTrack->getLocation();
++    return metadata;
++}
++
++QVariantMap ControllerScriptInterfaceLegacy::getS8DisplayState(
++        const QString& group, double centerPosition, double windowFraction) {
++    const double safeCenterPosition = qBound(0.0, centerPosition, 1.0);
++    const double safeWindowFraction = qBound(0.001, windowFraction, 1.0);
++    QVariantMap state{
++            {QStringLiteral("available"), false},
++            {QStringLiteral("waveformComplete"), false},
++            {QStringLiteral("waveform"), QVariantList()},
++            {QStringLiteral("overview"), QVariantList()},
++            {QStringLiteral("hotcues"), QVariantList()},
++            {QStringLiteral("beatgridAvailable"), false},
++            {QStringLiteral("artworkAvailable"), false},
++            {QStringLiteral("waveformWindowStart"),
++                    safeCenterPosition - safeWindowFraction / 2.0},
++            {QStringLiteral("waveformWindowEnd"),
++                    safeCenterPosition + safeWindowFraction / 2.0}};
++
++    const TrackPointer pTrack = PlayerInfo::instance().getTrackInfo(group);
++    if (!pTrack) {
++        return state;
++    }
++
++    const ConstWaveformPointer pWaveform = pTrack->getWaveform();
++    const ConstWaveformPointer pOverview = pTrack->getWaveformSummary();
++    state[QStringLiteral("available")] = true;
++    state[QStringLiteral("waveformComplete")] = pWaveform &&
++            pWaveform->getDataSize() > 0 &&
++            pWaveform->getCompletion() >= pWaveform->getDataSize();
++    state[QStringLiteral("waveform")] = downsampleWaveformWindow(pWaveform,
++            kS8WaveformBins,
++            safeCenterPosition,
++            safeWindowFraction);
++    state[QStringLiteral("overview")] = downsampleWaveform(pOverview, kS8OverviewBins);
++
++    QVariantList hotcues;
++    for (const CuePointer& pCue : pTrack->getCuePoints()) {
++        if (!pCue || pCue->getHotCue() < 0 || pCue->getHotCue() >= 8) {
++            continue;
++        }
++        hotcues.append(QVariantMap{
++                {QStringLiteral("slot"), pCue->getHotCue() + 1},
++                {QStringLiteral("position"),
++                        pCue->getPosition().toEngineSamplePosMaybeInvalid()},
++                {QStringLiteral("label"), pCue->getLabel()},
++                {QStringLiteral("color"),
++                        mixxx::RgbColor::toQString(pCue->getColor())}});
++    }
++    state[QStringLiteral("hotcues")] = hotcues;
++    return state;
++}
++
++QVariantMap ControllerScriptInterfaceLegacy::getS8BrowserState(int visibleRows) {
++    const int safeVisibleRows = qBound(4, visibleRows, 9);
++    QVariantMap state;
++    auto fetch = [&state, safeVisibleRows]() {
++        state = browserStateOnGuiThread(safeVisibleRows);
++    };
++    auto* pApp = QCoreApplication::instance();
++    if (!pApp) {
++        return browserStateOnGuiThread(safeVisibleRows);
++    }
++    if (pApp->thread() == QThread::currentThread()) {
++        fetch();
++    } else if (!QMetaObject::invokeMethod(
++                       pApp, fetch, Qt::BlockingQueuedConnection)) {
++        return QVariantMap{
++                {QStringLiteral("available"), false},
++                {QStringLiteral("rows"), QVariantList()}};
++    }
++    return state;
++}
++
++bool ControllerScriptInterfaceLegacy::s8BrowserSort(int sortColumnId, bool descending) {
++    bool changed = false;
++    auto sort = [&changed, sortColumnId, descending]() {
++        auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
++        if (!app) {
++            return;
++        }
++        for (QWidget* top : app->topLevelWidgets()) {
++            auto* library = top->findChild<WLibrary*>();
++            auto* table = library ? library->getCurrentTrackTableView() : nullptr;
++            auto* model = table ? dynamic_cast<TrackModel*>(table->model()) : nullptr;
++            if (!table || !model) {
++                continue;
++            }
++            const auto columnId = static_cast<TrackModel::SortColumnId>(sortColumnId);
++            const int column = model->columnIndexFromSortColumnId(columnId);
++            if (column < 0 || !model->isColumnSortable(column)) {
++                return;
++            }
++            const Qt::SortOrder order = descending
++                    ? Qt::DescendingOrder
++                    : Qt::AscendingOrder;
++            QHeaderView* header = table->horizontalHeader();
++            if (!header || (header->sortIndicatorSection() == column &&
++                                   header->sortIndicatorOrder() == order)) {
++                return;
++            }
++            // Follow the same signal path as a user clicking the table header.
++            // WTrackTableView::slotSortingChanged() then calls doSortByColumn(),
++            // which preserves the complete selection and never replaces the
++            // current library model.
++            header->setSortIndicator(column, order);
++            changed = true;
++            return;
++        }
++    };
++    auto* app = QCoreApplication::instance();
++    if (!app) {
++        return false;
++    }
++    if (app->thread() == QThread::currentThread()) {
++        sort();
++    } else {
++        QMetaObject::invokeMethod(app, sort, Qt::BlockingQueuedConnection);
++    }
++    return changed;
++}
++
++bool ControllerScriptInterfaceLegacy::s8PreviewSelected(bool play) {
++    bool changed = false;
++    auto preview = [&changed, play]() {
++        if (!play) {
++            ControlObject::set(ConfigKey("[PreviewDeck1]", "play"), 0.0);
++            changed = true;
++            return;
++        }
++        auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
++        if (!app) {
++            return;
++        }
++        for (QWidget* top : app->topLevelWidgets()) {
++            auto* library = top->findChild<WLibrary*>();
++            auto* table = library ? library->getCurrentTrackTableView() : nullptr;
++            if (!table || !table->currentIndex().isValid()) {
++                continue;
++            }
++            table->loadSelectedTrackToGroup(QStringLiteral("[PreviewDeck1]"), true);
++            changed = true;
++            return;
++        }
++    };
++    auto* app = QCoreApplication::instance();
++    if (!app) {
++        return false;
++    }
++    if (app->thread() == QThread::currentThread()) {
++        preview();
++    } else {
++        QMetaObject::invokeMethod(app, preview, Qt::BlockingQueuedConnection);
++    }
++    return changed;
++}
++
++bool ControllerScriptInterfaceLegacy::s8PreviewSeek(double seconds) {
++    const double duration = ControlObject::get(ConfigKey("[PreviewDeck1]", "duration"));
++    if (!(duration > 0.0) || !std::isfinite(seconds)) {
++        return false;
++    }
++    const double current = ControlObject::get(ConfigKey("[PreviewDeck1]", "playposition"));
++    ControlObject::set(ConfigKey("[PreviewDeck1]", "playposition"),
++            qBound(0.0, current + seconds / duration, 1.0));
++    return true;
++}
++
++bool ControllerScriptInterfaceLegacy::s8BrowserBack(bool root) {
++    bool changed = false;
++    auto navigate = [&changed, root]() {
++        auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
++        if (!app) {
++            return;
++        }
++        for (QWidget* top : app->topLevelWidgets()) {
++            auto* sidebar = top->findChild<WLibrarySidebar*>();
++            if (!sidebar || !sidebar->model()) {
++                continue;
++            }
++            QModelIndex target = sidebar->currentIndex();
++            if (root) {
++                while (target.parent().isValid()) {
++                    target = target.parent();
++                }
++            } else if (target.parent().isValid()) {
++                target = target.parent();
++            }
++            if (!target.isValid()) {
++                target = sidebar->model()->index(0, 0);
++            }
++            if (target.isValid()) {
++                sidebar->setCurrentIndex(target);
++                sidebar->scrollTo(target);
++                sidebar->setFocus(Qt::OtherFocusReason);
++                changed = true;
++            }
++            return;
++        }
++    };
++    auto* app = QCoreApplication::instance();
++    if (!app) {
++        return false;
++    }
++    if (app->thread() == QThread::currentThread()) {
++        navigate();
++    } else {
++        QMetaObject::invokeMethod(app, navigate, Qt::BlockingQueuedConnection);
++    }
++    return changed;
++}
++
++QVariantMap ControllerScriptInterfaceLegacy::getS8Artwork(const QString& group) {
++    if (!QRegularExpression(QStringLiteral("^\\[Channel[1-4]\\]$")).match(group).hasMatch()) {
++        return {{QStringLiteral("available"), false}};
++    }
++    const TrackPointer track = PlayerInfo::instance().getTrackInfo(group);
++    CoverInfo cover;
++    if (track) {
++        cover = track->getCoverInfoWithLocation();
++    }
++    auto& entry = m_s8Artwork[group];
++    // Do not queue another decode until the previous job finishes. Invalidate
++    // immediately on replacement; an obsolete cover is never returned.
++    if (!entry.initialized || entry.cover != cover) {
++        entry.cover = cover;
++        entry.initialized = true;
++        ++entry.revision;
++        entry.state = {{QStringLiteral("available"), false},
++                {QStringLiteral("revision"), entry.revision}};
++    }
++    if (entry.pendingActive && !entry.pending.isFinished()) {
++        return entry.state;
++    }
++    if (entry.pendingActive && entry.pending.isFinished()) {
++        const QVariantMap result = entry.pending.result();
++        entry.pending = {};
++        entry.pendingActive = false;
++        if (result.value(QStringLiteral("revision")).toULongLong() == entry.revision) {
++            entry.state = result;
++            entry.state[QStringLiteral("decoded")] = true;
++        }
++    }
++    if (!entry.state.value(QStringLiteral("decoded")).toBool()) {
++        const quint64 revision = entry.revision;
++        if (!track || cover.type == CoverInfoRelative::NONE) {
++            entry.state[QStringLiteral("decoded")] = true;
++        } else {
++            entry.pendingActive = true;
++            entry.pending = QtConcurrent::run([cover, track, revision]() {
++                QVariantMap result{{QStringLiteral("available"), false},
++                        {QStringLiteral("revision"), revision}};
++                const QImage image = cover.loadImage(track).image;
++                if (image.isNull()) {
++                    return result;
++                }
++                const QImage thumb = image.scaled(64, 64, Qt::KeepAspectRatio,
++                        Qt::SmoothTransformation).convertToFormat(QImage::Format_RGB32);
++                QVariantList pixels;
++                pixels.reserve(thumb.width() * thumb.height());
++                for (int y = 0; y < thumb.height(); ++y) {
++                    const auto* row = reinterpret_cast<const QRgb*>(thumb.constScanLine(y));
++                    for (int x = 0; x < thumb.width(); ++x) {
++                        pixels.append(((qRed(row[x]) >> 3) << 11) |
++                                ((qGreen(row[x]) >> 2) << 5) | (qBlue(row[x]) >> 3));
++                    }
++                }
++                result[QStringLiteral("available")] = true;
++                result[QStringLiteral("width")] = thumb.width();
++                result[QStringLiteral("height")] = thumb.height();
++                result[QStringLiteral("pixels")] = pixels;
++                return result;
++            });
++        }
++    }
++    return entry.state;
++}
++
++QVariantMap ControllerScriptInterfaceLegacy::getS8SliceWindow(const QString& group, double sliceBeats) {
++    QVariantMap result{{QStringLiteral("available"), false}};
++    if (!QRegularExpression(QStringLiteral("^\\[Channel[1-4]\\]$")).match(group).hasMatch() ||
++            !std::isfinite(sliceBeats) || sliceBeats < 0.25 || sliceBeats > 4.0) {
++        return result;
++    }
++    const TrackPointer track = PlayerInfo::instance().getTrackInfo(group);
++    if (!track) {
++        return result;
++    }
++    const auto beats = track->getBeats();
++    const double samples = getValue(group, QStringLiteral("track_samples"));
++    const double position = getValue(group, QStringLiteral("playposition"));
++    if (!beats || samples <= 0 || !std::isfinite(position)) {
++        return result;
++    }
++    const auto anchor = beats->findPrevBeat(mixxx::audio::FramePos::fromEngineSamplePosMaybeInvalid(
++            qBound(0.0, position, 1.0) * samples));
++    if (!anchor.isValid()) {
++        return result;
++    }
++    QVariantList boundaries;
++    for (int index = 0; index <= 8; ++index) {
++        const double offset = sliceBeats * index;
++        const int whole = static_cast<int>(qFloor(offset));
++        const auto begin = beats->findNthBeat(anchor, whole + 1);
++        const auto end = beats->findNthBeat(anchor, whole + 2);
++        if (!begin.isValid() || !end.isValid()) {
++            return result;
++        }
++        const double sample = begin.toEngineSamplePosMaybeInvalid() + (offset - whole) *
++                (end.toEngineSamplePosMaybeInvalid() - begin.toEngineSamplePosMaybeInvalid());
++        if (sample < 0 || sample > samples) {
++            return result;
++        }
++        boundaries.append(sample);
++    }
++    result[QStringLiteral("available")] = true;
++    result[QStringLiteral("identity")] = track->getLocation();
++    result[QStringLiteral("samples")] = samples;
++    result[QStringLiteral("sliceBeats")] = sliceBeats;
++    result[QStringLiteral("boundaries")] = boundaries;
++    {
++        const QMutexLocker lock(&s_s8SliceMutex);
++        if (s_s8SliceToken >= (quint64(1) << 52)) {
++            return {{QStringLiteral("available"), false}};
++        }
++        const quint64 token = ++s_s8SliceToken;
++        s_s8SliceIdentities[group] = {track, token};
++        result[QStringLiteral("token")] = token;
++    }
++    return result;
++}
++
++bool ControllerScriptInterfaceLegacy::isS8SliceWindowCurrent(const QString& group, double token) {
++    if (!std::isfinite(token) || token <= 0 || token != qFloor(token)) {
++        return false;
++    }
++    const TrackPointer current = PlayerInfo::instance().getTrackInfo(group);
++    const QMutexLocker lock(&s_s8SliceMutex);
++    const auto captured = s_s8SliceIdentities.value(group);
++    return current && captured.token == static_cast<quint64>(token) && captured.track.lock() == current;
++}
++
+ double ControllerScriptInterfaceLegacy::getValue(const QString& group, const QString& name) {
+     ControlObjectScript* coScript = getControlObjectScript(group, name);
+     if (coScript == nullptr) {
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+index 4d3e280..12c3935 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+@@ -2,8 +2,13 @@
+ 
+ #include <QJSValue>
+ #include <QObject>
++#include <QVariantList>
++#include <QVariantMap>
++#include <QFuture>
+ 
+ #include "controllers/softtakeover.h"
++#include "library/coverart.h"
++#include "preferences/usersettings.h"
+ #include "util/alphabetafilter.h"
+ #include "util/runtimeloggingcategory.h"
+ 
+@@ -22,7 +27,29 @@ class ControllerScriptInterfaceLegacy : public QObject {
+ 
+     virtual ~ControllerScriptInterfaceLegacy();
+ 
++    static void configureS8Preferences(UserSettingsWeakPointer pConfig);
++
+     Q_INVOKABLE QJSValue getSetting(const QString& name);
++    /// Return a bounded, read-only metadata snapshot for a loaded player.
++    Q_INVOKABLE QVariantMap getTrackMetadata(const QString& group);
++    /// Return bounded display-only data that is not available through ControlObjects.
++    /// Waveforms are downsampled before crossing the script boundary.
++    Q_INVOKABLE QVariantMap getS8DisplayState(
++            const QString& group, double centerPosition, double windowFraction);
++    /// Return the rows currently visible around Mixxx's real Library selection.
++    Q_INVOKABLE QVariantMap getS8BrowserState(int visibleRows = 5);
++    Q_INVOKABLE bool s8BrowserBack(bool root);
++    Q_INVOKABLE bool s8BrowserSort(int sortColumnId, bool descending);
++    Q_INVOKABLE bool s8PreviewSelected(bool play);
++    Q_INVOKABLE bool s8PreviewSeek(double seconds);
++    Q_INVOKABLE QVariantMap getS8EffectState(int effectUnit);
++    Q_INVOKABLE bool s8LoadEffect(int effectUnit, int slot, int visibleEffectIndex);
++    Q_INVOKABLE bool s8LoadChainPreset(int effectUnit, int presetIndex);
++    Q_INVOKABLE double getS8Preference(const QString& name, double fallback);
++    Q_INVOKABLE bool setS8Preference(const QString& name, double value);
++    Q_INVOKABLE QVariantMap getS8Artwork(const QString& group);
++    Q_INVOKABLE QVariantMap getS8SliceWindow(const QString& group, double sliceBeats);
++    Q_INVOKABLE bool isS8SliceWindowCurrent(const QString& group, double token);
+     Q_INVOKABLE double getValue(const QString& group, const QString& name);
+     Q_INVOKABLE void setValue(const QString& group, const QString& name, double newValue);
+     Q_INVOKABLE double getParameter(const QString& group, const QString& name);
+@@ -78,6 +105,16 @@ class ControllerScriptInterfaceLegacy : public QObject {
+     virtual void timerEvent(QTimerEvent* event);
+ 
+   private:
++    struct S8ArtworkEntry {
++        CoverInfo cover;
++        QFuture<QVariantMap> pending;
++        QVariantMap state;
++        bool initialized = false;
++        bool pendingActive = false;
++        quint64 revision = 0;
++    };
++    // Four player entries only. Worker jobs capture values, never this QObject.
++    QHash<QString, S8ArtworkEntry> m_s8Artwork;
+     QJSValue makeConnectionInternal(const QString& group,
+             const QString& name,
+             const QJSValue& callback,
+diff --git a/src/effects/effectsmanager.cpp b/src/effects/effectsmanager.cpp
+index 9db9362..6e52ca6 100644
+--- a/src/effects/effectsmanager.cpp
++++ b/src/effects/effectsmanager.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <QDir>
+ #include <QMetaType>
++#include <QReadWriteLock>
+ 
+ #include "effects/chains/equalizereffectchain.h"
+ #include "effects/chains/outputeffectchain.h"
+@@ -19,6 +20,8 @@
+ namespace {
+ const unsigned int kEffectMessagePipeFifoSize = 2048;
+ const QString kEffectsXmlFile = QStringLiteral("effects.xml");
++QReadWriteLock s_s8ControllerEffectCatalogLock;
++QVariantMap s_s8ControllerEffectCatalog;
+ } // anonymous namespace
+ 
+ EffectsManager::EffectsManager(
+@@ -48,6 +51,16 @@ EffectsManager::EffectsManager(
+             new EffectChainPresetManager(pConfig, m_pBackendManager));
+ 
+     m_pVisibleEffectsList = VisibleEffectsListPointer(new VisibleEffectsList());
++    QObject::connect(m_pVisibleEffectsList.data(),
++            &VisibleEffectsList::visibleEffectsListChanged,
++            [this]() { publishS8ControllerEffectCatalog(); });
++    QObject::connect(m_pChainPresetManager.data(),
++            &EffectChainPresetManager::effectChainPresetListUpdated,
++            [this]() { publishS8ControllerEffectCatalog(); });
++    QObject::connect(m_pChainPresetManager.data(),
++            &EffectChainPresetManager::quickEffectChainPresetListUpdated,
++            [this]() { publishS8ControllerEffectCatalog(); });
++    publishS8ControllerEffectCatalog();
+ }
+ 
+ EffectsManager::~EffectsManager() {
+@@ -244,6 +257,58 @@ void EffectsManager::readEffectsXml() {
+     }
+ 
+     m_pVisibleEffectsList->readEffectsXml(doc, m_pBackendManager);
++    publishS8ControllerEffectCatalog();
++}
++
++QVariantMap EffectsManager::s8ControllerEffectCatalog() {
++    QReadLocker locker(&s_s8ControllerEffectCatalogLock);
++    return s_s8ControllerEffectCatalog;
++}
++
++void EffectsManager::publishS8ControllerEffectCatalog() {
++    QVariantList visibleEffects;
++    const auto appendManifest = [](const EffectManifestPointer& pManifest) {
++        QVariantList knobParameters;
++        QVariantList buttonParameters;
++        for (const auto& pParameter : pManifest->parameters()) {
++            QVariantMap parameter{{QStringLiteral("id"), pParameter->id()},
++                    {QStringLiteral("name"), pParameter->name()},
++                    {QStringLiteral("shortName"), pParameter->shortName()}};
++            if (pParameter->parameterType() == EffectParameterType::Knob) {
++                knobParameters.append(parameter);
++            } else if (pParameter->parameterType() == EffectParameterType::Button) {
++                buttonParameters.append(parameter);
++            }
++        }
++        return QVariantMap{{QStringLiteral("id"), pManifest->id()},
++                {QStringLiteral("name"), pManifest->displayName()},
++                {QStringLiteral("uniqueId"), pManifest->uniqueId()},
++                {QStringLiteral("mixingEq"), pManifest->isMixingEQ()},
++                {QStringLiteral("mainEq"), pManifest->isMainEQ()},
++                {QStringLiteral("knobParameters"), knobParameters},
++                {QStringLiteral("buttonParameters"), buttonParameters}};
++    };
++    for (const auto& pManifest : m_pVisibleEffectsList->getList()) {
++        visibleEffects.append(appendManifest(pManifest));
++    }
++    QVariantList allEffects;
++    for (const auto& pManifest : m_pBackendManager->getManifests()) {
++        allEffects.append(appendManifest(pManifest));
++    }
++    QVariantList chainPresets;
++    for (const auto& pPreset : m_pChainPresetManager->getPresetsSorted()) {
++        chainPresets.append(pPreset->name());
++    }
++    QVariantList quickEffectPresets;
++    for (const auto& pPreset : m_pChainPresetManager->getQuickEffectPresetsSorted()) {
++        quickEffectPresets.append(pPreset->name());
++    }
++    QVariantMap snapshot{{QStringLiteral("visibleEffects"), visibleEffects},
++            {QStringLiteral("allEffects"), allEffects},
++            {QStringLiteral("chainPresets"), chainPresets},
++            {QStringLiteral("quickEffectPresets"), quickEffectPresets}};
++    QWriteLocker locker(&s_s8ControllerEffectCatalogLock);
++    s_s8ControllerEffectCatalog = std::move(snapshot);
+ }
+ 
+ void EffectsManager::readEffectsXmlSingleDeck(const QString& deckGroup) {
+diff --git a/src/effects/effectsmanager.h b/src/effects/effectsmanager.h
+index f2b579e..fd41b7a 100644
+--- a/src/effects/effectsmanager.h
++++ b/src/effects/effectsmanager.h
+@@ -3,6 +3,7 @@
+ #include <QHash>
+ #include <QList>
+ #include <QSet>
++#include <QVariantMap>
+ 
+ #include "control/controlpotmeter.h"
+ #include "effects/backends/effectsbackendmanager.h"
+@@ -67,6 +68,10 @@ class EffectsManager {
+         return m_pVisibleEffectsList;
+     }
+ 
++    /// Thread-safe immutable metadata for controller display integrations.
++    /// Musical state remains authoritative in the corresponding ControlObjects.
++    static QVariantMap s8ControllerEffectCatalog();
++
+     void registerInputChannel(const ChannelHandleAndGroup& handle_group);
+     const QSet<ChannelHandleAndGroup>& registeredInputChannels() const {
+         return m_registeredInputChannels;
+@@ -89,6 +94,7 @@ class EffectsManager {
+     void readEffectsXml();
+     void readEffectsXmlSingleDeck(const QString& deckGroup);
+     void saveEffectsXml();
++    void publishS8ControllerEffectCatalog();
+ 
+     QSet<ChannelHandleAndGroup> m_registeredInputChannels;
+     QSet<ChannelHandleAndGroup> m_registeredOutputChannels;
+diff --git a/src/engine/controls/loopingcontrol.cpp b/src/engine/controls/loopingcontrol.cpp
+index 3213f58..8dbd591 100644
+--- a/src/engine/controls/loopingcontrol.cpp
++++ b/src/engine/controls/loopingcontrol.cpp
+@@ -1751,8 +1751,17 @@ void LoopingControl::slotBeatJump(double beats) {
+         slotLoopMove(beats);
+     } else {
+         // seekExact bypasses Quantize, because a beat jump is implicit quantized
+-        const auto seekPosition = pBeats->findNBeatsFromPosition(currentPosition, beats);
++        auto seekPosition = pBeats->findNBeatsFromPosition(currentPosition, beats);
+         if (seekPosition.isValid()) {
++            // Never enqueue a position outside the playable frame interval. Some
++            // beat implementations extrapolate before the first beat, which used
++            // to let repeated backward beatjumps seek to negative positions and
++            // leave playback in an invalid state.
++            seekPosition = math_max(seekPosition, mixxx::audio::kStartFramePos);
++            const auto trackEndPosition = frameInfo().trackEndPosition;
++            if (trackEndPosition.isValid()) {
++                seekPosition = math_min(seekPosition, trackEndPosition);
++            }
+             seekExact(seekPosition);
+         }
+     }
+diff --git a/src/engine/enginebuffer.cpp b/src/engine/enginebuffer.cpp
+index 83bd03b..21e827f 100644
+--- a/src/engine/enginebuffer.cpp
++++ b/src/engine/enginebuffer.cpp
+@@ -31,6 +31,7 @@
+ #include "util/logger.h"
+ #include "util/sample.h"
+ #include "util/timer.h"
++#include "soundio/experimentalaudiodiagnostics.h"
+ #include "waveform/visualplayposition.h"
+ 
+ #ifdef __RUBBERBAND__
+@@ -168,6 +169,9 @@ EngineBuffer::EngineBuffer(const QString& group,
+     m_pRepeat->setButtonMode(ControlPushButton::TOGGLE);
+ 
+     m_pSampleRate = new ControlProxy(kAppGroup, QStringLiteral("samplerate"), this);
++    m_pSampleRate->connectValueChanged(this,
++            &EngineBuffer::slotSampleRateChanged,
++            Qt::DirectConnection);
+ 
+     m_pTrackSamples = new ControlObject(ConfigKey(m_group, "track_samples"));
+     m_pTrackSampleRate = new ControlObject(ConfigKey(m_group, "track_samplerate"));
+@@ -268,6 +272,8 @@ EngineBuffer::EngineBuffer(const QString& group,
+ #ifdef __RUBBERBAND__
+     m_pScaleRB = new EngineBufferScaleRubberBand(m_pReadAheadManager);
+ #endif
++    updateScalerSampleRatesLocked(
++            mixxx::audio::SampleRate::fromDouble(m_pSampleRate->get()));
+     slotKeylockEngineChanged(m_pKeylockEngine->get());
+     m_pScaleVinyl = m_pScaleLinear;
+     m_pScale = m_pScaleVinyl;
+@@ -507,6 +513,44 @@ bool EngineBuffer::isReverse() const {
+     return m_reverse_old;
+ }
+ 
++void EngineBuffer::slotSampleRateChanged(double sampleRate) {
++    const auto lockStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
++    m_pause.lock();
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordLockWait(
++            mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs() - lockStartNs);
++    updateScalerSampleRatesLocked(mixxx::audio::SampleRate::fromDouble(sampleRate));
++    m_pause.unlock();
++}
++
++void EngineBuffer::updateScalerSampleRatesLocked(mixxx::audio::SampleRate sampleRate) {
++    if (!sampleRate.isValid()) {
++        return;
++    }
++    const auto scalerStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
++    m_pScaleLinear->setSampleRate(sampleRate);
++    m_pScaleST->setSampleRate(sampleRate);
++#ifdef __RUBBERBAND__
++    m_pScaleRB->setSampleRate(sampleRate);
++#endif
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordScalerPreparation(
++            mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs() - scalerStartNs,
++            false);
++}
++
++bool EngineBuffer::scalerSampleRatesMatchLocked(mixxx::audio::SampleRate sampleRate) const {
++    if (!sampleRate.isValid() ||
++            m_pScaleLinear->getOutputSignal().getSampleRate() != sampleRate ||
++            m_pScaleST->getOutputSignal().getSampleRate() != sampleRate) {
++        return false;
++    }
++#ifdef __RUBBERBAND__
++    if (m_pScaleRB->getOutputSignal().getSampleRate() != sampleRate) {
++        return false;
++    }
++#endif
++    return true;
++}
++
+ // WARNING: Always called from the EngineWorker thread pool
+ void EngineBuffer::slotTrackLoading() {
+     // Pause EngineBuffer from processing frames
+@@ -539,7 +583,11 @@ void EngineBuffer::slotTrackLoaded(TrackPointer pTrack,
+         kLogger.trace() << "slotTrackLoaded" << getGroup();
+     }
+     TrackPointer pOldTrack = m_pCurrentTrack;
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordTrackLoaded();
++    const auto lockStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
+     m_pause.lock();
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordLockWait(
++            mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs() - lockStartNs);
+ 
+     m_visualPlayPos->setInvalid();
+     m_playPos = kInitialPlayPosition; // for execute seeks to 0.0
+@@ -547,6 +595,8 @@ void EngineBuffer::slotTrackLoaded(TrackPointer pTrack,
+     m_pTrackSamples->set(trackNumSamples);
+     m_pTrackSampleRate->set(trackSampleRate.toDouble());
+     m_pTrackLoaded->forceSet(1);
++    updateScalerSampleRatesLocked(
++            mixxx::audio::SampleRate::fromDouble(m_pSampleRate->get()));
+ 
+     // Reset slip mode
+     m_pSlipButton->set(0);
+@@ -1180,18 +1230,18 @@ void EngineBuffer::process(CSAMPLE* pOutput, const int iBufferSize) {
+ 
+     m_sampleRate = mixxx::audio::SampleRate::fromDouble(m_pSampleRate->get());
+ 
+-    // If the sample rate has changed, force Rubberband to reset so that
+-    // it doesn't reallocate when the user engages keylock during playback.
+-    // We do this even if rubberband is not active.
+-    m_pScaleLinear->setSampleRate(m_sampleRate);
+-    m_pScaleST->setSampleRate(m_sampleRate);
+-#ifdef __RUBBERBAND__
+-    m_pScaleRB->setSampleRate(m_sampleRate);
+-#endif
+-
+     bool hasStableTrack = m_pTrackLoaded->toBool() && m_iTrackLoading.loadAcquire() == 0;
+     if (hasStableTrack && m_pause.tryLock()) {
+-        processTrackLocked(pOutput, iBufferSize, m_sampleRate);
++        if (scalerSampleRatesMatchLocked(m_sampleRate)) {
++            processTrackLocked(pOutput, iBufferSize, m_sampleRate);
++        } else {
++            // A scaler is never reconfigured from the callback. The direct
++            // sample-rate connection and slotTrackLoaded prepare it before a
++            // stable track reaches this point. This is a fail-safe for an
++            // unexpected lifecycle violation, avoiding use of stale buffers.
++            SampleUtil::clear(pOutput, iBufferSize);
++            m_rate_old = 0;
++        }
+         // release the pauselock
+         m_pause.unlock();
+     } else {
+diff --git a/src/engine/enginebuffer.h b/src/engine/enginebuffer.h
+index 57f0b9a..36af60f 100644
+--- a/src/engine/enginebuffer.h
++++ b/src/engine/enginebuffer.h
+@@ -238,6 +238,7 @@ class EngineBuffer : public EngineObject {
+     void noVinylControlInputConfigured();
+ 
+   private slots:
++    void slotSampleRateChanged(double sampleRate);
+     void slotTrackLoading();
+     void slotTrackLoaded(
+             TrackPointer pTrack,
+@@ -250,6 +251,11 @@ class EngineBuffer : public EngineObject {
+     void slotUpdatedTrackBeats();
+ 
+   private:
++    // These functions require m_pause to be held. They move scaler setup out
++    // of the audio callback while retaining the existing scaler API.
++    void updateScalerSampleRatesLocked(mixxx::audio::SampleRate sampleRate);
++    bool scalerSampleRatesMatchLocked(mixxx::audio::SampleRate sampleRate) const;
++
+     struct QueuedSeek {
+         mixxx::audio::FramePos position;
+         enum SeekRequest seekType;
+diff --git a/src/library/rekordbox/rekordboxfeature.cpp b/src/library/rekordbox/rekordboxfeature.cpp
+index 174cc59..931d097 100644
+--- a/src/library/rekordbox/rekordboxfeature.cpp
++++ b/src/library/rekordbox/rekordboxfeature.cpp
+@@ -23,6 +23,7 @@
+ #include "track/beats.h"
+ #include "track/cue.h"
+ #include "track/keyfactory.h"
++#include "track/keyutils.h"
+ #include "track/track.h"
+ #include "util/color/color.h"
+ #include "util/db/dbconnectionpooled.h"
+@@ -93,6 +94,7 @@ bool createLibraryTable(QSqlDatabase& database, const QString& tableName) {
+             "    bitrate TEXT,"
+             "    bpm FLOAT,"
+             "    key TEXT,"
++            "    key_id INTEGER,"
+             "    rating INTEGER,"
+             "    analyze_path TEXT UNIQUE,"
+             "    device TEXT,"
+@@ -371,6 +373,7 @@ void insertTrack(
+     float bpm = static_cast<float>(track->tempo() / 100.0);
+     int bitrate = static_cast<int>(track->bitrate());
+     QString key = keysMap[track->key_id()];
++    const int keyId = static_cast<int>(KeyUtils::guessKeyFromText(key));
+     int playtime = static_cast<int>(track->duration());
+     int rating = static_cast<int>(track->rating());
+     QString comment = getText(track->comment());
+@@ -389,6 +392,7 @@ void insertTrack(
+     query.bindValue(":comment", comment);
+     query.bindValue(":tracknumber", tracknumber);
+     query.bindValue(":key", key);
++    query.bindValue(":key_id", keyId);
+     query.bindValue(":bpm", bpm);
+     query.bindValue(":bitrate", bitrate);
+     query.bindValue(":analyze_path", anlzPath);
+@@ -473,10 +477,10 @@ QString parseDeviceDB(mixxx::DbConnectionPoolPtr dbConnectionPool, TreeItem* dev
+     query.prepare("INSERT INTO " + kRekordboxLibraryTable +
+             " (rb_id, artist, title, album, year,"
+             "genre,comment,tracknumber,bpm, bitrate,duration, location,"
+-            "rating,key,analyze_path,device,color) VALUES (:rb_id, :artist, "
++            "rating,key,key_id,analyze_path,device,color) VALUES (:rb_id, :artist, "
+             ":title, :album, :year,:genre,"
+             ":comment, :tracknumber,:bpm, :bitrate,:duration, :location,"
+-            ":rating,:key,:analyze_path,:device,:color)");
++            ":rating,:key,:key_id,:analyze_path,:device,:color)");
+ 
+     int audioFilesCount = 0;
+ 
+@@ -1330,6 +1334,7 @@ RekordboxFeature::RekordboxFeature(
+             LIBRARYTABLE_BITRATE,
+             LIBRARYTABLE_BPM,
+             LIBRARYTABLE_KEY,
++            LIBRARYTABLE_KEY_ID,
+             LIBRARYTABLE_COLOR,
+             REKORDBOX_ANALYZE_PATH};
+ 
+diff --git a/src/soundio/experimentalaudiodiagnostics.h b/src/soundio/experimentalaudiodiagnostics.h
+new file mode 100644
+index 0000000..26275e0
+--- /dev/null
++++ b/src/soundio/experimentalaudiodiagnostics.h
+@@ -0,0 +1,217 @@
++// M10038 experimental diagnostics. This header is intentionally header-only so
++// the instrumentation does not change the production target graph.
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <limits>
++
++#include <QString>
++
++namespace mixxx::experimental::audio_diagnostics {
++
++class AudioDiagnostics {
++  public:
++    static constexpr int kDurationBuckets = 64;
++    static constexpr int kUnderflowCodes = 32;
++    static constexpr std::uint64_t kLoadCorrelationWindowNs = 5'000'000'000ULL;
++
++    AudioDiagnostics() {
++        for (auto& count : m_durationBuckets) {
++            count.store(0, std::memory_order_relaxed);
++        }
++        for (auto& count : m_underflowCodes) {
++            count.store(0, std::memory_order_relaxed);
++        }
++        for (auto& count : m_statusFlags) {
++            count.store(0, std::memory_order_relaxed);
++        }
++    }
++
++    static std::uint64_t nowNs() {
++        return static_cast<std::uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(
++                        std::chrono::steady_clock::now().time_since_epoch())
++                        .count());
++    }
++
++    void recordCallbackStart(std::uint64_t startNs,
++            std::uint32_t framesPerBuffer,
++            std::uint32_t statusFlags) {
++        m_callbackCount.fetch_add(1, std::memory_order_relaxed);
++        m_callbackFrames.fetch_add(framesPerBuffer, std::memory_order_relaxed);
++        updateMax(m_maxFrames, framesPerBuffer);
++        updateMin(m_minFrames, framesPerBuffer);
++        for (std::uint32_t bit = 0; bit < m_statusFlags.size(); ++bit) {
++            if (statusFlags & (1U << bit)) {
++                m_statusFlags[bit].fetch_add(1, std::memory_order_relaxed);
++            }
++        }
++        m_lastCallbackStartNs.store(startNs, std::memory_order_relaxed);
++    }
++
++    void recordCallbackEnd(std::uint64_t startNs) {
++        const std::uint64_t endNs = nowNs();
++        const std::uint64_t durationNs = endNs - startNs;
++        m_callbackDurationTotalNs.fetch_add(durationNs, std::memory_order_relaxed);
++        updateMax(m_callbackDurationMaxNs, durationNs);
++        m_durationBuckets[durationBucket(durationNs)].fetch_add(1, std::memory_order_relaxed);
++
++        const std::uint64_t loadNs = m_lastTrackLoadNs.load(std::memory_order_relaxed);
++        if (loadNs <= endNs && endNs - loadNs <= kLoadCorrelationWindowNs) {
++            m_callbacksWithinLoadWindow.fetch_add(1, std::memory_order_relaxed);
++            updateMax(m_callbackDurationMaxWithinLoadWindowNs, durationNs);
++        }
++    }
++
++    void recordTrackLoaded() {
++        m_trackLoadCount.fetch_add(1, std::memory_order_relaxed);
++        m_lastTrackLoadNs.store(nowNs(), std::memory_order_relaxed);
++    }
++
++    void recordScalerPreparation(std::uint64_t durationNs, bool inCallback) {
++        if (inCallback) {
++            m_callbackScalerCount.fetch_add(1, std::memory_order_relaxed);
++            m_callbackScalerTotalNs.fetch_add(durationNs, std::memory_order_relaxed);
++            updateMax(m_callbackScalerMaxNs, durationNs);
++        } else {
++            m_prewarmScalerCount.fetch_add(1, std::memory_order_relaxed);
++            m_prewarmScalerTotalNs.fetch_add(durationNs, std::memory_order_relaxed);
++            updateMax(m_prewarmScalerMaxNs, durationNs);
++        }
++    }
++
++    void recordLockWait(std::uint64_t durationNs) {
++        m_lockWaitCount.fetch_add(1, std::memory_order_relaxed);
++        m_lockWaitTotalNs.fetch_add(durationNs, std::memory_order_relaxed);
++        updateMax(m_lockWaitMaxNs, durationNs);
++    }
++
++    void recordUnderflow(int code) {
++        if (code >= 0 && code < kUnderflowCodes) {
++            m_underflowCodes[code].fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++
++    void recordAudioLatencyOverload() {
++        m_audioLatencyOverloadCount.fetch_add(1, std::memory_order_relaxed);
++    }
++
++    QString summary() const {
++        const std::uint64_t callbacks = m_callbackCount.load(std::memory_order_relaxed);
++        return QStringLiteral("callbacks=%1 frames_total=%2 frames_min=%3 frames_max=%4 "
++                              "callback_ns_total=%5 callback_ns_max=%6 callback_ns_p95_approx=%7 "
++                              "track_loads=%8 callbacks_5s_after_load=%9 callback_ns_max_5s_after_load=%10 "
++                              "status_input_underflow=%11 status_input_overflow=%12 "
++                              "status_output_underflow=%13 status_output_overflow=%14 status_priming=%15 "
++                              "underflow_code_1=%16 underflow_code_2=%17 underflow_code_3=%18 "
++                              "underflow_code_4=%19 underflow_code_5=%20 underflow_code_6=%21 "
++                              "audio_latency_overload_events=%22 callback_scaler_calls=%23 "
++                              "callback_scaler_ns_total=%24 callback_scaler_ns_max=%25 "
++                              "prewarm_scaler_calls=%26 prewarm_scaler_ns_total=%27 prewarm_scaler_ns_max=%28 "
++                              "lock_wait_calls=%29 lock_wait_ns_total=%30 lock_wait_ns_max=%31")
++                .arg(callbacks)
++                .arg(m_callbackFrames.load(std::memory_order_relaxed))
++                .arg(m_minFrames.load(std::memory_order_relaxed) == std::numeric_limits<std::uint64_t>::max()
++                                ? 0
++                                : m_minFrames.load(std::memory_order_relaxed))
++                .arg(m_maxFrames.load(std::memory_order_relaxed))
++                .arg(m_callbackDurationTotalNs.load(std::memory_order_relaxed))
++                .arg(m_callbackDurationMaxNs.load(std::memory_order_relaxed))
++                .arg(durationPercentileNs(callbacks, 95))
++                .arg(m_trackLoadCount.load(std::memory_order_relaxed))
++                .arg(m_callbacksWithinLoadWindow.load(std::memory_order_relaxed))
++                .arg(m_callbackDurationMaxWithinLoadWindowNs.load(std::memory_order_relaxed))
++                .arg(m_statusFlags[0].load(std::memory_order_relaxed))
++                .arg(m_statusFlags[1].load(std::memory_order_relaxed))
++                .arg(m_statusFlags[2].load(std::memory_order_relaxed))
++                .arg(m_statusFlags[3].load(std::memory_order_relaxed))
++                .arg(m_statusFlags[4].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[1].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[2].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[3].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[4].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[5].load(std::memory_order_relaxed))
++                .arg(m_underflowCodes[6].load(std::memory_order_relaxed))
++                .arg(m_audioLatencyOverloadCount.load(std::memory_order_relaxed))
++                .arg(m_callbackScalerCount.load(std::memory_order_relaxed))
++                .arg(m_callbackScalerTotalNs.load(std::memory_order_relaxed))
++                .arg(m_callbackScalerMaxNs.load(std::memory_order_relaxed))
++                .arg(m_prewarmScalerCount.load(std::memory_order_relaxed))
++                .arg(m_prewarmScalerTotalNs.load(std::memory_order_relaxed))
++                .arg(m_prewarmScalerMaxNs.load(std::memory_order_relaxed))
++                .arg(m_lockWaitCount.load(std::memory_order_relaxed))
++                .arg(m_lockWaitTotalNs.load(std::memory_order_relaxed))
++                .arg(m_lockWaitMaxNs.load(std::memory_order_relaxed));
++    }
++
++  private:
++    static int durationBucket(std::uint64_t durationNs) {
++        int bucket = 0;
++        while (durationNs > 1 && bucket < kDurationBuckets - 1) {
++            durationNs >>= 1;
++            ++bucket;
++        }
++        return bucket;
++    }
++
++    std::uint64_t durationPercentileNs(std::uint64_t callbackCount, int percentile) const {
++        if (callbackCount == 0) {
++            return 0;
++        }
++        const std::uint64_t target = (callbackCount * percentile + 99) / 100;
++        std::uint64_t cumulative = 0;
++        for (int bucket = 0; bucket < kDurationBuckets; ++bucket) {
++            cumulative += m_durationBuckets[bucket].load(std::memory_order_relaxed);
++            if (cumulative >= target) {
++                return 1ULL << bucket;
++            }
++        }
++        return 1ULL << (kDurationBuckets - 1);
++    }
++
++    static void updateMax(std::atomic<std::uint64_t>& target, std::uint64_t value) {
++        std::uint64_t previous = target.load(std::memory_order_relaxed);
++        while (previous < value &&
++                !target.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {
++        }
++    }
++
++    static void updateMin(std::atomic<std::uint64_t>& target, std::uint64_t value) {
++        std::uint64_t previous = target.load(std::memory_order_relaxed);
++        while (previous > value &&
++                !target.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {
++        }
++    }
++
++    std::atomic<std::uint64_t> m_callbackCount{0};
++    std::atomic<std::uint64_t> m_callbackFrames{0};
++    std::atomic<std::uint64_t> m_minFrames{std::numeric_limits<std::uint64_t>::max()};
++    std::atomic<std::uint64_t> m_maxFrames{0};
++    std::atomic<std::uint64_t> m_callbackDurationTotalNs{0};
++    std::atomic<std::uint64_t> m_callbackDurationMaxNs{0};
++    std::array<std::atomic<std::uint64_t>, kDurationBuckets> m_durationBuckets;
++    std::array<std::atomic<std::uint64_t>, kUnderflowCodes> m_underflowCodes;
++    std::array<std::atomic<std::uint64_t>, 32> m_statusFlags;
++    std::atomic<std::uint64_t> m_lastCallbackStartNs{0};
++    std::atomic<std::uint64_t> m_trackLoadCount{0};
++    std::atomic<std::uint64_t> m_lastTrackLoadNs{0};
++    std::atomic<std::uint64_t> m_callbacksWithinLoadWindow{0};
++    std::atomic<std::uint64_t> m_callbackDurationMaxWithinLoadWindowNs{0};
++    std::atomic<std::uint64_t> m_callbackScalerCount{0};
++    std::atomic<std::uint64_t> m_callbackScalerTotalNs{0};
++    std::atomic<std::uint64_t> m_callbackScalerMaxNs{0};
++    std::atomic<std::uint64_t> m_prewarmScalerCount{0};
++    std::atomic<std::uint64_t> m_prewarmScalerTotalNs{0};
++    std::atomic<std::uint64_t> m_prewarmScalerMaxNs{0};
++    std::atomic<std::uint64_t> m_lockWaitCount{0};
++    std::atomic<std::uint64_t> m_lockWaitTotalNs{0};
++    std::atomic<std::uint64_t> m_lockWaitMaxNs{0};
++    std::atomic<std::uint64_t> m_audioLatencyOverloadCount{0};
++};
++
++inline AudioDiagnostics g_audioDiagnostics;
++
++} // namespace mixxx::experimental::audio_diagnostics
+diff --git a/src/soundio/sounddeviceportaudio.cpp b/src/soundio/sounddeviceportaudio.cpp
+index b4b7131..f9aac27 100644
+--- a/src/soundio/sounddeviceportaudio.cpp
++++ b/src/soundio/sounddeviceportaudio.cpp
+@@ -750,6 +750,9 @@ int SoundDevicePortAudio::callbackProcessDrift(
+         const PaStreamCallbackTimeInfo *timeInfo,
+         PaStreamCallbackFlags statusFlags) {
+     Q_UNUSED(timeInfo);
++    const auto callbackStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackStart(
++            callbackStartNs, framesPerBuffer, statusFlags);
+     Trace trace("SoundDevicePortAudio::callbackProcessDrift %1",
+             m_deviceId.debugName());
+ 
+@@ -875,6 +878,7 @@ int SoundDevicePortAudio::callbackProcessDrift(
+             //qDebug() << "callbackProcess read:" << (float)readAvailable / outChunkSize << "Buffer empty";
+         }
+     }
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackEnd(callbackStartNs);
+     return m_callbackResult.load(std::memory_order_acquire);
+ }
+ 
+@@ -883,6 +887,9 @@ int SoundDevicePortAudio::callbackProcess(const SINT framesPerBuffer,
+         const PaStreamCallbackTimeInfo *timeInfo,
+         PaStreamCallbackFlags statusFlags) {
+     Q_UNUSED(timeInfo);
++    const auto callbackStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackStart(
++            callbackStartNs, framesPerBuffer, statusFlags);
+     Trace trace("SoundDevicePortAudio::callbackProcess %1", m_deviceId.debugName());
+ 
+     if (statusFlags & (paOutputUnderflow | paInputOverflow)) {
+@@ -927,6 +934,7 @@ int SoundDevicePortAudio::callbackProcess(const SINT framesPerBuffer,
+             //qDebug() << "callbackProcess read:" << "Buffer empty";
+         }
+     }
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackEnd(callbackStartNs);
+     return m_callbackResult.load(std::memory_order_acquire);
+ }
+ 
+@@ -936,6 +944,9 @@ int SoundDevicePortAudio::callbackProcessClkRef(
+         PaStreamCallbackFlags statusFlags) {
+     // This must be the very first call, else timeInfo becomes invalid
+     updateCallbackEntryToDacTime(framesPerBuffer, timeInfo);
++    const auto callbackStartNs = mixxx::experimental::audio_diagnostics::AudioDiagnostics::nowNs();
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackStart(
++            callbackStartNs, framesPerBuffer, statusFlags);
+ 
+     Trace trace("SoundDevicePortAudio::callbackProcessClkRef %1",
+             m_deviceId.debugName());
+@@ -1072,6 +1083,7 @@ int SoundDevicePortAudio::callbackProcessClkRef(
+ 
+     updateAudioLatencyUsage(framesPerBuffer);
+ 
++    mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordCallbackEnd(callbackStartNs);
+     return m_callbackResult.load(std::memory_order_acquire);
+ }
+ 
+diff --git a/src/soundio/soundmanager.cpp b/src/soundio/soundmanager.cpp
+index c56ec55..75cb542 100644
+--- a/src/soundio/soundmanager.cpp
++++ b/src/soundio/soundmanager.cpp
+@@ -95,6 +95,8 @@ SoundManager::~SoundManager() {
+         Pa_Terminate();
+         m_paInitialized = false;
+     }
++    qInfo().noquote() << "M10038_AUDIO_DIAGNOSTICS"
++                      << mixxx::experimental::audio_diagnostics::g_audioDiagnostics.summary();
+     // vinyl control proxies and input buffers are freed in closeDevices, called
+     // by clearDeviceList -- bkgood
+ 
+@@ -698,6 +700,7 @@ void SoundManager::processUnderflowHappened(SINT framesPerBuffer) {
+             m_audioLatencyOverload.set(1.0);
+             m_audioLatencyOverloadCount.set(
+                     m_audioLatencyOverloadCount.get() + 1);
++            mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordAudioLatencyOverload();
+             m_underflowUpdateCount = CPU_OVERLOAD_DURATION *
+                     m_config.getSampleRate() / framesPerBuffer / 1000;
+ 
+diff --git a/src/soundio/soundmanager.h b/src/soundio/soundmanager.h
+index 42fdd1e..55926ca 100644
+--- a/src/soundio/soundmanager.h
++++ b/src/soundio/soundmanager.h
+@@ -12,6 +12,7 @@
+ #include "preferences/usersettings.h"
+ #include "soundio/sounddevice.h"
+ #include "soundio/soundmanagerconfig.h"
++#include "soundio/experimentalaudiodiagnostics.h"
+ #include "util/cmdlineargs.h"
+ #include "util/types.h"
+ 
+@@ -96,6 +97,7 @@ class SoundManager : public QObject {
+     }
+ 
+     void underflowHappened(int code) {
++        mixxx::experimental::audio_diagnostics::g_audioDiagnostics.recordUnderflow(code);
+         m_underflowHappened = 1;
+         // Disable the engine warnings by default, because printing a warning is a
+         // locking function that will make the problem worse
+diff --git a/src/test/controllerscriptenginelegacy_test.cpp b/src/test/controllerscriptenginelegacy_test.cpp
+index 6c3d6e4..f258885 100644
+--- a/src/test/controllerscriptenginelegacy_test.cpp
++++ b/src/test/controllerscriptenginelegacy_test.cpp
+@@ -3,6 +3,9 @@
+ #include <QScopedPointer>
+ #include <QTemporaryFile>
+ #include <QThread>
++#include <QTemporaryDir>
++#include <QElapsedTimer>
++#include <QImageWriter>
+ #include <QtDebug>
+ #include <memory>
+ 
+@@ -10,6 +13,9 @@
+ #include "control/controlpotmeter.h"
+ #include "controllers/softtakeover.h"
+ #include "preferences/usersettings.h"
++#include "mixer/playerinfo.h"
++#include "track/track.h"
++#include "track/beats.h"
+ #include "test/mixxxtest.h"
+ #include "util/color/colorpalette.h"
+ #include "util/time.h"
+@@ -90,6 +96,105 @@ TEST_F(ControllerScriptEngineLegacyTest, commonScriptHasNoErrors) {
+     EXPECT_TRUE(evaluateScriptFile(commonScript));
+ }
+ 
++class S8Bridge289Test : public ControllerScriptEngineLegacyTest {
++  protected:
++    void SetUp() override {
++        PlayerInfo::create();
++        ControllerScriptEngineLegacyTest::SetUp();
++    }
++    void TearDown() override {
++        ControllerScriptEngineLegacyTest::TearDown();
++        PlayerInfo::destroy();
++    }
++    QJSValue awaitArtwork() {
++        QElapsedTimer elapsed;
++        elapsed.start();
++        QJSValue result;
++        do {
++            result = evaluate("engine.getS8Artwork('[Channel1]')");
++            if (result.property("available").toBool()) {
++                break;
++            }
++            processEvents();
++            QThread::msleep(1);
++        } while (elapsed.elapsed() < 2000);
++        return result;
++    }
++};
++
++TEST_F(S8Bridge289Test, ArtworkMissingAndInvalidGroupsFailClosed) {
++    EXPECT_FALSE(evaluate("engine.getS8Artwork('[Channel1]').available").toBool());
++    EXPECT_FALSE(evaluate("engine.getS8Artwork('[Channel5]').available").toBool());
++    EXPECT_FALSE(evaluate("engine.getS8Artwork('[Sampler1]').available").toBool());
++    EXPECT_FALSE(evaluate("engine.getS8SliceWindow('[Channel1]', 1).available").toBool());
++    EXPECT_FALSE(evaluate("engine.getS8SliceWindow('[Channel1]', NaN).available").toBool());
++}
++
++TEST_F(S8Bridge289Test, ArtworkWorkerProducesBounded565AndInvalidatesReplacement) {
++    QTemporaryDir dir;
++    ASSERT_TRUE(dir.isValid());
++    QImage red(64, 64, QImage::Format_RGB32);
++    red.fill(Qt::red);
++    const QString redPath = dir.filePath("red.png");
++    QImageWriter redWriter(redPath, "png");
++    ASSERT_TRUE(redWriter.write(red)) << redWriter.errorString().toStdString()
++                                     << " path=" << redPath.toStdString();
++    auto track = Track::newTemporary();
++    CoverInfoRelative cover;
++    cover.type = CoverInfoRelative::FILE;
++    cover.coverLocation = redPath;
++    track->setCoverInfo(cover);
++    PlayerInfo::instance().setTrackInfo("[Channel1]", track);
++    auto result = awaitArtwork();
++    ASSERT_TRUE(result.property("available").toBool());
++    EXPECT_EQ(64, result.property("width").toInt());
++    EXPECT_EQ(4096, result.property("pixels").property("length").toInt());
++    EXPECT_EQ(0xF800, result.property("pixels").property(0).toInt());
++    const int revision = result.property("revision").toInt();
++    for (int i = 0; i < 10; ++i) {
++        EXPECT_EQ(revision, evaluate("engine.getS8Artwork('[Channel1]').revision").toInt());
++    }
++    QImage blue(16, 16, QImage::Format_RGB32);
++    blue.fill(Qt::blue);
++    const QString bluePath = dir.filePath("blue.png");
++    ASSERT_TRUE(blue.save(bluePath));
++    cover.coverLocation = bluePath;
++    track->setCoverInfo(cover);
++    result = evaluate("engine.getS8Artwork('[Channel1]')");
++    EXPECT_FALSE(result.property("available").toBool());
++    EXPECT_GT(result.property("revision").toInt(), revision);
++    result = awaitArtwork();
++    ASSERT_TRUE(result.property("available").toBool());
++    EXPECT_EQ(0x001F, result.property("pixels").property(0).toInt());
++}
++
++TEST_F(S8Bridge289Test, SliceCaptureUsesNativeBeatsAndRejectsTrackEnd) {
++    auto samples = std::make_unique<ControlObject>(ConfigKey("[Channel1]", "track_samples"));
++    auto position = std::make_unique<ControlObject>(ConfigKey("[Channel1]", "playposition"));
++    samples->set(2646000);
++    position->set(0.2);
++    auto track = Track::newTemporary();
++    track->setAudioProperties(mixxx::audio::ChannelCount(2), mixxx::audio::SampleRate(44100),
++            mixxx::audio::Bitrate(), mixxx::Duration::fromSeconds(30));
++    track->trySetBeats(mixxx::Beats::fromConstTempo(track->getSampleRate(),
++            mixxx::audio::kStartFramePos, mixxx::Bpm(60.0)));
++    PlayerInfo::instance().setTrackInfo("[Channel1]", track);
++    const auto result = evaluate("engine.getS8SliceWindow('[Channel1]', 0.25)");
++    ASSERT_TRUE(result.property("available").toBool());
++    const auto boundaries = result.property("boundaries");
++    ASSERT_EQ(9, boundaries.property("length").toInt());
++    for (int i = 0; i < 9; ++i) {
++        EXPECT_DOUBLE_EQ(529200 + 22050 * i, boundaries.property(i).toNumber());
++    }
++    const QString validate = QStringLiteral("engine.isS8SliceWindowCurrent('[Channel1]', %1)")
++                                     .arg(result.property("token").toNumber());
++    EXPECT_TRUE(evaluate(validate).toBool());
++    position->set(0.999);
++    EXPECT_FALSE(evaluate("engine.getS8SliceWindow('[Channel1]', 4).available").toBool());
++    PlayerInfo::instance().setTrackInfo("[Channel1]", Track::newTemporary());
++    EXPECT_FALSE(evaluate(validate).toBool());
++}
++
+ TEST_F(ControllerScriptEngineLegacyTest, setValue) {
+     auto co = std::make_unique<ControlObject>(ConfigKey("[Test]", "co"));
+     EXPECT_TRUE(evaluateAndAssert("engine.setValue('[Test]', 'co', 1.0);"));
+diff --git a/src/test/looping_control_test.cpp b/src/test/looping_control_test.cpp
+index 8a543b8..13e0ead 100644
+--- a/src/test/looping_control_test.cpp
++++ b/src/test/looping_control_test.cpp
+@@ -996,6 +996,40 @@ TEST_F(LoopingControlTest, Beatjump_JumpsByBeats) {
+     EXPECT_FRAMEPOS_EQ(mixxx::audio::kStartFramePos, currentFramePos());
+ }
+ 
++TEST_F(LoopingControlTest, BeatjumpBackwardAtStartNeverSeeksBeforeTrack) {
++    const auto bpm = mixxx::Bpm{120};
++    m_pTrack1->trySetBpm(bpm);
++    ProcessBuffer();
++
++    m_pBeatJumpSize->set(4.0);
++    for (int press = 0; press < 8; ++press) {
++        m_pButtonBeatJumpBackward->set(1.0);
++        m_pButtonBeatJumpBackward->set(0.0);
++        ProcessBuffer();
++        EXPECT_FRAMEPOS_EQ(mixxx::audio::kStartFramePos, currentFramePos());
++    }
++
++    // Playback must still be usable after attempting to jump before the start.
++    m_pButtonPlay->set(1.0);
++    ProcessBuffer();
++    EXPECT_GT(m_pButtonPlay->get(), 0.0);
++    EXPECT_GT(currentFramePos(), mixxx::audio::kStartFramePos);
++    const auto playingFramePos = currentFramePos();
++    ProcessBuffer();
++    EXPECT_GT(currentFramePos(), playingFramePos);
++
++    m_pButtonPlay->set(0.0);
++    ProcessBuffer();
++    const auto pausedFramePos = currentFramePos();
++    m_pButtonPlay->set(1.0);
++    ProcessBuffer();
++    EXPECT_GT(currentFramePos(), pausedFramePos);
++    m_pButtonBeatJumpBackward->set(1.0);
++    m_pButtonBeatJumpBackward->set(0.0);
++    ProcessBuffer();
++    EXPECT_GE(currentFramePos(), mixxx::audio::kStartFramePos);
++}
++
+ TEST_F(LoopingControlTest, Beatjump_MovesActiveLoop) {
+     const auto bpm = mixxx::Bpm{120};
+     m_pTrack1->trySetBpm(bpm);
+diff --git a/src/util/logging.cpp b/src/util/logging.cpp
+index 18ee917..edc01b2 100644
+--- a/src/util/logging.cpp
++++ b/src/util/logging.cpp
+@@ -461,11 +461,17 @@ void Logging::shutdown() {
+     qInstallMessageHandler(nullptr);
+ 
+     // Even though we uninstalled the message handler, other threads may have
+-    // already entered it.
+-    const auto locker = lockMutex(&s_mutexLogfile);
++    // already entered it. Do not allow a late/stuck logging call to keep the
++    // Windows process alive after the application has otherwise shut down.
++    // The operating system will close the file handle during process teardown
++    // if the bounded lock cannot be acquired.
++    if (!s_mutexLogfile.tryLock(1000)) {
++        return;
++    }
+     if (s_logfile.isOpen()) {
+         s_logfile.close();
+     }
++    s_mutexLogfile.unlock();
+ }
+ 
+ // static

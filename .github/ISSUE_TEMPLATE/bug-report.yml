@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a mapping or compatibility problem
+title: "[Bug] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include private information, proprietary captures, or raw device captures. Share only material you have rights to publish."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and expected behavior
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and version
+    validations:
+      required: true
+  - type: input
+    id: mixxx
+    attributes:
+      label: Mixxx version/revision and patch status
+  - type: input
+    id: hardware
+    attributes:
+      label: S8 hardware revision, if known
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps and tests
+  - type: textarea
+    id: extra
+    attributes:
+      label: Mapping improvement or platform request, if relevant
