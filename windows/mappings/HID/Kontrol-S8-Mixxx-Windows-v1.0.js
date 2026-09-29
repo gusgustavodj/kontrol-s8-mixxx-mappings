@@ -15776,6 +15776,9 @@ var S8WindowsV1 = (function() {
         Object.keys(LED_FIELDS_285).forEach(function(name) {
             setLedField285(name, false);
         });
+        // SYNC green channel; see SYNC_LED_COLOURS_285.
+        setPayloadIndexes285(0x80, [56], 0x00);
+        setPayloadIndexes285(0x81, [56], 0x00);
     }
 
     function sendLedReport285(reportId, payload, reason) {
@@ -15866,9 +15869,21 @@ var S8WindowsV1 = (function() {
         return 1 + ((pad - 1) * 3);
     }
 
+    // Pad LEDs take R, G, B in that order (matches PAD_COLOR_PALETTE in the
+    // protocol notes, and was confirmed on hardware: with B, G, R a red cue lit
+    // blue, blue lit orange, yellow lit light blue). The name is kept to avoid
+    // touching every caller.
+    // Mixxx colours are gamma-encoded screen values; the LEDs are linear, so
+    // mid-level channels look far too bright (orange lit yellow, light pink
+    // lit white). Gamma 2.2 decodes them to linear intensity.
+    function ledGamma285(channel) {
+        return Math.round(255 * Math.pow(channel / 255, 2.2));
+    }
+
     function rgbToBgr285(rgb) {
         var normalized = Math.floor(rgb) & 0xFFFFFF;
-        return [normalized & 0xFF, (normalized >> 8) & 0xFF, (normalized >> 16) & 0xFF];
+        return [ledGamma285((normalized >> 16) & 0xFF), ledGamma285((normalized >> 8) & 0xFF),
+            ledGamma285(normalized & 0xFF)];
     }
 
     function hotcueRgb285(group, pad) {
@@ -15913,8 +15928,8 @@ var S8WindowsV1 = (function() {
         if (rawBase === null || !payload) {
             return false;
         }
-        // raw[0] is the report ID. A candidate pad occupies raw B,G,R and
-        // therefore payload indexes raw-1. Never reconstruct this shared frame.
+        // raw[0] is the report ID. A pad occupies raw R,G,B and therefore
+        // payload indexes raw-1. Never reconstruct this shared frame.
         var bgr = rgbToBgr285(performancePadRgb(side, pad));
         var payloadBase = rawBase - 1;
         payload[payloadBase] = bgr[0];
@@ -16261,7 +16276,7 @@ var S8WindowsV1 = (function() {
         ["play_indicator", "cue_default", "slip_enabled"].forEach(function(control) {
             setLedField285(sideLedField285(side, control), safeGet(group, control, 0) > 0);
         });
-        setLedField285(sideLedField285(side, "sync_enabled"), syncIndicatorForSide(side));
+        setSyncLed285(side);
         refreshModeIdentity285(side);
         applyLoopRingFrame285(side, state.loopRingSegment[side]);
         setLedField285("FX_SELECT_" + side, !!state.fxSelectVisible[side]);
@@ -16275,24 +16290,35 @@ var S8WindowsV1 = (function() {
         }
     }
 
-    function syncIndicatorForSide(side) {
-        var deck = deckForSide(side);
-        var group = "[Channel" + deck + "]";
-        if (safeGet(group, "sync_leader", 0) <= 0) {
-            return safeGet(group, "sync_enabled", 0) > 0;
+    // SYNC is a red/green LED: payload 57 = red, 56 = green (confirmed on
+    // hardware; red+green = orange/yellow). The base reports left green at 0x14
+    // on deck A only, so SYNC used to look green/orange on the left and red on
+    // the right. Both bytes are now owned here: [red, green].
+    var SYNC_LED_COLOURS_285 = Object.freeze({
+        OFF: [0x14, 0x00],      // dim red
+        FOLLOWER: [0x00, 0x7F], // green
+        LEADER: [0x7F, 0x20]    // orange: synced and tempo master
+    });
+
+    function syncLedState285(side) {
+        var group = "[Channel" + deckForSide(side) + "]";
+        if (safeGet(group, "sync_enabled", 0) <= 0) {
+            return "OFF";
         }
-        for (var follower = 1; follower <= availableDeckCount(); follower += 1) {
-            if (follower !== deck && safeGet("[Channel" + follower + "]", "sync_enabled", 0) > 0) {
-                return true;
-            }
-        }
-        return false;
+        return safeGet(group, "sync_leader", 0) > 0 ? "LEADER" : "FOLLOWER";
+    }
+
+    function setSyncLed285(side) {
+        var colour = SYNC_LED_COLOURS_285[syncLedState285(side)];
+        var reportId = side === "LEFT" ? 0x80 : 0x81;
+        setPayloadIndexes285(reportId, [57], colour[0]);
+        setPayloadIndexes285(reportId, [56], colour[1]);
     }
 
     function refreshSyncIndicators285(reason) {
         ["LEFT", "RIGHT"].forEach(function(side) {
-            updateLedField285(sideLedField285(side, "sync_enabled"),
-                syncIndicatorForSide(side), reason);
+            setSyncLed285(side);
+            sendLiveLedReport285(side === "LEFT" ? 0x80 : 0x81, reason);
         });
     }
 
@@ -19373,9 +19399,15 @@ var S8WindowsV1 = (function() {
             state.beatgridEdit[side] = !state.beatgridEdit[side];
             log("BEATGRID_EDIT_CONTEXT", {side: side, enabled: state.beatgridEdit[side]});
         } else if (/^BtnQuantizeMixer$/.test(id)) {
-            toggle(groupForSide(state.lastSide), "quantize");
-            updateLedField285("QUANTIZE", safeGet(groupForSide(state.lastSide), "quantize") > 0,
-                "QUANTIZE_TOGGLE");
+            // One global switch as in Traktor: Mixxx keeps quantize per deck, so
+            // toggling only the focused deck left the others in whatever state
+            // they had while the LED showed just the focused one.
+            var quantizeOn = !(safeGet(groupForSide(state.lastSide), "quantize") > 0);
+            for (var quantizeDeck = 1; quantizeDeck <= 4; quantizeDeck += 1) {
+                safeSet("[Channel" + quantizeDeck + "]", "quantize", quantizeOn ? 1 : 0);
+            }
+            updateLedField285("QUANTIZE", quantizeOn, "QUANTIZE_TOGGLE_ALL");
+            log("QUANTIZE_ALL_DECKS", {enabled: quantizeOn});
         } else if (/^BtnSnapMixer$/.test(id)) {
             log("SNAP_CONTEXT_ONLY", {focusSide: state.lastSide, reason: "NO_DISTINCT_APPROVED_MIXXX_POLICY_259"});
         } else if (/^BtnTempoMixer$/.test(id)) {
