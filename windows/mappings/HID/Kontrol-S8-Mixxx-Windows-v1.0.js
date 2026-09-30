@@ -15123,6 +15123,18 @@ var S8HidDecoder = (function () {
                 }
             });
         }
+        // Windows hidapi pads every input report to the largest one (109 bytes),
+        // so bindings captured there as R1/109 never see report 0x01 unpadded.
+        // Linux hidraw delivers it at its native 41 bytes. A field that lies
+        // wholly inside the declared canonical prefix is the same bytes either
+        // way; the state key stays per-domain, so nothing is shared.
+        if (view && view.kind === "CANONICAL_PREFIX_COMPATIBLE_CARRIER" &&
+                integer(view.length) && view.length < control.report_length &&
+                view.raw_length_preserved === control.report_length &&
+                field.byte_offset_with_report_id + field.field_width <= view.length &&
+                definition.lengths.indexOf(view.length) < 0) {
+            definition.lengths.push(view.length);
+        }
         definition.domain = "R" + control.report_id + "/" + control.report_length;
         if (control.encoding === "BITFIELD" &&
                 ["BUTTON", "PUSH", "TOUCH"].indexOf(control.signal_type) >= 0) {
@@ -15595,6 +15607,28 @@ var S8WindowsV1 = (function() {
     var browserStateConnection = null;
     var ledStateConnections285 = [];
     var ledLiveReports285 = Object.create(null);
+
+    // Controller setting "maximizeLibraryWhileBrowsing" (default true, the
+    // original behaviour). When false, the S8 browser leaves Mixxx's decks on
+    // screen: the mapping keeps "browser open" as its own state instead of
+    // mirroring it into [Skin],show_maximized_library, and never watches or
+    // writes that control. The S8 displays show the browser either way.
+    var MAXIMIZE_DESKTOP_LIBRARY = (function() {
+        try {
+            var value = engine.getSetting("maximizeLibraryWhileBrowsing");
+            return value === undefined || value === null ? true : !!value;
+        } catch (error) {
+            return true;
+        }
+    }());
+
+    // The focus-independent browser needs engine.setS8BrowserMode() and
+    // engine.s8BrowserEnter() from the Mixxx patch. Older patch builds keep the
+    // original focus-based navigation.
+    function nativeBrowserLevel() {
+        return typeof engine.setS8BrowserMode === "function" &&
+            typeof engine.s8BrowserEnter === "function";
+    }
     var pflLedConnections10004 = [];
     var bridgeGeneration = 0;
 
@@ -15638,6 +15672,7 @@ var S8WindowsV1 = (function() {
                 previousFocusedWidget: 0
             },
             browseDown: {LEFT: null, RIGHT: null},
+            browserLevel: {LEFT: "tracks", RIGHT: "tracks"},
             backDown: {LEFT: null, RIGHT: null},
             browsePrewarm: {LEFT: null, RIGHT: null},
             preview: {active: false, side: null},
@@ -17127,8 +17162,10 @@ var S8WindowsV1 = (function() {
         });
         if (state) {
             if (state.desktopLibrary.owned) {
-                safeSet("[Skin]", "show_maximized_library",
-                    state.desktopLibrary.previousMaximized ? 1 : 0);
+                if (MAXIMIZE_DESKTOP_LIBRARY) {
+                    safeSet("[Skin]", "show_maximized_library",
+                        state.desktopLibrary.previousMaximized ? 1 : 0);
+                }
                 restoreDesktopFocusIfOwned();
             }
             state.browserVisible.LEFT = false;
@@ -17592,6 +17629,9 @@ var S8WindowsV1 = (function() {
     }
 
     function syncProgramBrowserState(origin, forceLog) {
+        if (!MAXIMIZE_DESKTOP_LIBRARY) {
+            return state.programBrowserExpanded;
+        }
         var expanded = safeGet("[Skin]", "show_maximized_library") > 0;
         if (expanded !== state.programBrowserExpanded) {
             observeProgramBrowserState(expanded ? 1 : 0, origin);
@@ -17607,6 +17647,9 @@ var S8WindowsV1 = (function() {
 
     function connectProgramBrowserState() {
         browserStateConnection = null;
+        if (!MAXIMIZE_DESKTOP_LIBRARY) {
+            return;
+        }
         try {
             if (typeof engine.makeConnection === "function") {
                 browserStateConnection = engine.makeConnection(
@@ -17661,12 +17704,25 @@ var S8WindowsV1 = (function() {
         state.desktopLibrary.owned = false;
     }
 
+    // Browser level ("tree" = sidebar, "tracks" = track table), owned by the
+    // mapping. Navigation must not depend on Mixxx's keyboard focus: Qt has no
+    // focus widget while the Mixxx window is inactive, so [Library],MoveVertical
+    // and GoToItem silently do nothing. The native bridge renders this level.
+    function setBrowserLevel(side, level, reason) {
+        state.browserLevel[side] = level;
+        if (typeof engine.setS8BrowserMode === "function") {
+            engine.setS8BrowserMode(level);
+        }
+        log("BROWSER_LEVEL", {side: side, level: level, reason: reason});
+    }
+
     function openBrowser(side, reason) {
         acquireDesktopLibrary();
+        setBrowserLevel(side, "tracks", reason);
         state.fxSelectVisible[side] = false;
         state.lastSide = side;
         applyProgramBrowserState(true, side, reason, false);
-        if (!safeSet("[Skin]", "show_maximized_library", 1)) {
+        if (MAXIMIZE_DESKTOP_LIBRARY && !safeSet("[Skin]", "show_maximized_library", 1)) {
             applyProgramBrowserState(false, null, "OPEN_WRITE_FAILED", false);
             restoreDesktopFocusIfOwned();
             return false;
@@ -17674,7 +17730,7 @@ var S8WindowsV1 = (function() {
         log("BROWSER_OPEN", {
             side: side,
             deck: deckForSide(side),
-            windowsDesktopLibraryVisible: true,
+            windowsDesktopLibraryVisible: MAXIMIZE_DESKTOP_LIBRARY,
             s8DisplayBridgePublished: true
         });
         return true;
@@ -17682,9 +17738,12 @@ var S8WindowsV1 = (function() {
 
     function closeBrowser(reason, side) {
         applyProgramBrowserState(false, null, reason, false);
+        if (typeof engine.setS8BrowserMode === "function") {
+            engine.setS8BrowserMode("");
+        }
         // A long press is a global toggle. Collapse explicitly even when Mixxx was
         // expanded outside this mapping; do not restore a stale cached value.
-        if (!safeSet("[Skin]", "show_maximized_library", 0)) {
+        if (MAXIMIZE_DESKTOP_LIBRARY && !safeSet("[Skin]", "show_maximized_library", 0)) {
             syncProgramBrowserState("CLOSE_WRITE_FAILED", false);
             log("BROWSER_CLOSE_FAILED", {side: side, reason: reason});
             return false;
@@ -17991,10 +18050,18 @@ var S8WindowsV1 = (function() {
             openBrowser(side, "BROWSE_PUSH_DECK_VIEW");
             return;
         }
-        var focusedWidget = Math.round(safeGet("[Library]", "focused_widget"));
-        if (focusedWidget === 2) {
-            pulse("[Library]", "GoToItem");
-            log("BROWSER_TREE_ENTER", {side: side});
+        if (!nativeBrowserLevel()) {
+            if (Math.round(safeGet("[Library]", "focused_widget")) === 2) {
+                pulse("[Library]", "GoToItem");
+                log("BROWSER_TREE_ENTER", {side: side, result: "FOCUS_LEGACY"});
+                return;
+            }
+        } else if (state.browserLevel[side] === "tree") {
+            var entered = engine.s8BrowserEnter();
+            if (entered === "tracks") {
+                setBrowserLevel(side, "tracks", "TREE_ENTER_LEAF");
+            }
+            log("BROWSER_TREE_ENTER", {side: side, result: entered});
             return;
         }
         requestLoad(side, down.targetDeck, down.focusRevision);
@@ -18054,7 +18121,15 @@ var S8WindowsV1 = (function() {
         // Loop Rotary and every other relative encoder remain untouched.
         var acceleration = state.shifted[side] ? 10 : 1;
         var signed = (event.direction === "CW" ? -magnitude : magnitude) * acceleration;
-        safeSet("[Library]", "MoveVertical", signed);
+        // Focus-independent: SelectPlaylist sends the key straight to the
+        // sidebar widget, SelectTrackKnob moves the current track table.
+        if (!nativeBrowserLevel()) {
+            safeSet("[Library]", "MoveVertical", signed);
+        } else if (state.browserLevel[side] === "tree") {
+            safeSet("[Playlist]", "SelectPlaylist", signed);
+        } else {
+            safeSet("[Playlist]", "SelectTrackKnob", signed);
+        }
         log("ROTARY_" + side, {
             decodedDirection: event.direction,
             delta: signed,
@@ -19256,11 +19331,22 @@ var S8WindowsV1 = (function() {
             return;
         }
         if (state.browserVisible[side]) {
-            var changed = typeof engine.s8BrowserBack === "function" && engine.s8BrowserBack(false);
-            if (!changed) {
-                log("BROWSER_BACK_UNAVAILABLE", {side: side});
+            if (!nativeBrowserLevel()) {
+                var legacyChanged = typeof engine.s8BrowserBack === "function" &&
+                    engine.s8BrowserBack(false);
+                log("BROWSER_BACK_PARENT", {side: side, changed: !!legacyChanged});
+                return;
             }
-            log("BROWSER_BACK_PARENT", {side: side});
+            // Track list -> sidebar -> parent folder -> ... -> close at the top.
+            if (state.browserLevel[side] === "tracks") {
+                setBrowserLevel(side, "tree", "BACK_TO_TREE");
+                return;
+            }
+            var changed = typeof engine.s8BrowserBack === "function" && engine.s8BrowserBack(false);
+            log("BROWSER_BACK_PARENT", {side: side, changed: !!changed});
+            if (!changed) {
+                closeBrowser("BACK_AT_TOP", side);
+            }
             return;
         }
         state.fxSelectVisible[side] = false;

@@ -8,6 +8,12 @@
       <product protocol="hid" vendor_id="0x17cc" product_id="0x1370" interface_number="0x5" />
     </devices>
   </info>
+  <settings>
+    <option variable="maximizeLibraryWhileBrowsing" type="boolean" default="true"
+        label="Maximize the Mixxx library while the S8 browser is open">
+      <description>Off keeps the decks visible; the S8 displays show the browser either way.</description>
+    </option>
+  </settings>
   <controller id="Kontrol S8 Mixxx Windows v1.0 HID">
     <scriptfiles>
       <file filename="Kontrol-S8-Mixxx-Windows-v1.0.js" functionprefix="S8WindowsV1" /></scriptfiles>

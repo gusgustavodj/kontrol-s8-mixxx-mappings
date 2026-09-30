@@ -1,0 +1,140 @@
+From 3f8f1299fed36840fe2a040cd7491c38626ebd9d Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@teide.tech>
+Date: Wed, 30 Sep 2026 00:22:51 +0200
+Subject: [PATCH] S8: explicit browser level, focus-independent enter, Back
+ reports top level
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../controllerscriptinterfacelegacy.cpp       | 73 ++++++++++++++++++-
+ .../legacy/controllerscriptinterfacelegacy.h  |  2 +
+ 2 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+index e6c1b25..adcc287 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+@@ -4,6 +4,7 @@
+ #include <QHeaderView>
+ #include <QThread>
+ #include <QtMath>
++#include <atomic>
+ #include <cmath>
+ #include <QMutexLocker>
+ #include <QtConcurrent/QtConcurrentRun>
+@@ -145,6 +146,35 @@ QVariantList downsampleWaveformWindow(const ConstWaveformPointer& pWaveform,
+     return result;
+ }
+ 
++// Browser level set by the S8 mapping. Keyboard focus is unusable for this:
++// Qt has no focus widget while the Mixxx window is inactive, which on Linux
++// desktops is most of the time while working on the controller.
++enum class S8BrowserMode { Auto, Tree, Tracks };
++std::atomic<S8BrowserMode> s_s8BrowserMode{S8BrowserMode::Auto};
++
++WLibrarySidebar* findLibrarySidebar() {
++    auto* pApp = qobject_cast<QApplication*>(QCoreApplication::instance());
++    if (!pApp) {
++        return nullptr;
++    }
++    for (QWidget* pTopLevel : pApp->topLevelWidgets()) {
++        if (auto* pSidebar = pTopLevel->findChild<WLibrarySidebar*>()) {
++            return pSidebar;
++        }
++    }
++    return nullptr;
++}
++
++template<typename F>
++void runOnGuiThread(F&& function) {
++    auto* pApp = QCoreApplication::instance();
++    if (!pApp || pApp->thread() == QThread::currentThread()) {
++        function();
++    } else {
++        QMetaObject::invokeMethod(pApp, std::forward<F>(function), Qt::BlockingQueuedConnection);
++    }
++}
++
+ QVariantMap browserStateOnGuiThread(int requestedVisibleRows) {
+     const int visibleRows = qBound(4, requestedVisibleRows, 9);
+     QVariantMap state{
+@@ -177,7 +207,11 @@ QVariantMap browserStateOnGuiThread(int requestedVisibleRows) {
+     // the browser as unavailable immediately after it was opened.
+     const bool sidebarSelected =
+             ControlObject::get(ConfigKey("[Library]", "focused_widget")) == 2.0;
+-    if (pSidebar && (pSidebar->hasFocus() || sidebarSelected)) {
++    const S8BrowserMode mode = s_s8BrowserMode.load();
++    const bool treeMode = mode == S8BrowserMode::Tree ||
++            (mode == S8BrowserMode::Auto && pSidebar &&
++                    (pSidebar->hasFocus() || sidebarSelected));
++    if (pSidebar && treeMode) {
+         const QModelIndex selected = pSidebar->currentIndex();
+         const QModelIndex parent = selected.parent();
+         auto* pModel = pSidebar->model();
+@@ -769,6 +803,10 @@ bool ControllerScriptInterfaceLegacy::s8BrowserBack(bool root) {
+                 }
+             } else if (target.parent().isValid()) {
+                 target = target.parent();
++            } else if (target.isValid()) {
++                // Already at the top level: report no movement so the mapping
++                // can close the browser instead.
++                return;
+             }
+             if (!target.isValid()) {
+                 target = sidebar->model()->index(0, 0);
+@@ -794,6 +832,39 @@ bool ControllerScriptInterfaceLegacy::s8BrowserBack(bool root) {
+     return changed;
+ }
+ 
++bool ControllerScriptInterfaceLegacy::setS8BrowserMode(const QString& mode) {
++    if (mode == QStringLiteral("tree")) {
++        s_s8BrowserMode = S8BrowserMode::Tree;
++    } else if (mode == QStringLiteral("tracks")) {
++        s_s8BrowserMode = S8BrowserMode::Tracks;
++    } else {
++        s_s8BrowserMode = S8BrowserMode::Auto;
++        return mode.isEmpty();
++    }
++    return true;
++}
++
++// Browse push at tree level, independent of keyboard focus: a leaf (playlist,
++// crate, folder) is already shown in the track table by its selection, so the
++// mapping switches to track level; a branch is expanded/collapsed instead.
++// Returns "tracks", "toggled", or "" if there is no sidebar.
++QString ControllerScriptInterfaceLegacy::s8BrowserEnter() {
++    QString result;
++    runOnGuiThread([&result]() {
++        WLibrarySidebar* pSidebar = findLibrarySidebar();
++        if (!pSidebar || !pSidebar->model()) {
++            return;
++        }
++        if (pSidebar->isLeafNodeSelected()) {
++            result = QStringLiteral("tracks");
++        } else {
++            pSidebar->toggleSelectedItem();
++            result = QStringLiteral("toggled");
++        }
++    });
++    return result;
++}
++
+ QVariantMap ControllerScriptInterfaceLegacy::getS8Artwork(const QString& group) {
+     if (!QRegularExpression(QStringLiteral("^\\[Channel[1-4]\\]$")).match(group).hasMatch()) {
+         return {{QStringLiteral("available"), false}};
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+index 12c3935..d1e50ec 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+@@ -39,6 +39,8 @@ class ControllerScriptInterfaceLegacy : public QObject {
+     /// Return the rows currently visible around Mixxx's real Library selection.
+     Q_INVOKABLE QVariantMap getS8BrowserState(int visibleRows = 5);
+     Q_INVOKABLE bool s8BrowserBack(bool root);
++    Q_INVOKABLE bool setS8BrowserMode(const QString& mode);
++    Q_INVOKABLE QString s8BrowserEnter();
+     Q_INVOKABLE bool s8BrowserSort(int sortColumnId, bool descending);
+     Q_INVOKABLE bool s8PreviewSelected(bool play);
+     Q_INVOKABLE bool s8PreviewSeek(double seconds);
+-- 
+2.53.0
+
